@@ -2,14 +2,6 @@
 
 Simple CounterStrikeSharp plugin that replaces connect/disconnect messages and resolves city/country data with `GeoLite2-City.mmdb`.
 
-## Build
-
-```powershell
-cd ConnectAnnounceCssharp
-dotnet restore
-dotnet build -c Release
-```
-
 ## Installation
 
 Copy the complete `ConnectAnnounce` folder from the release zip to:
