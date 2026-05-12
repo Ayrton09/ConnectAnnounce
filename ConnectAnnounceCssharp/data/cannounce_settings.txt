@@ -1,0 +1,13 @@
+"CountryShow"
+{
+	"messages"
+	{
+		"playerjoin"		"{PLAYERNAME} connected from {PLAYERCOUNTRY} | {PLAYERCITY}"
+		"playerdisc"		"{PLAYERNAME} ({STEAMID}) disconnected! {DISC_REASON_LABEL}{DISC_REASON}"
+	}
+	"messages_admin"
+	{
+		"playerjoin"		"{PLAYERNAME} connected from {PLAYERCOUNTRY} | {PLAYERCITY}"
+		"playerdisc"		"{PLAYERNAME} ({STEAMID}) disconnected! {DISC_REASON_LABEL}{DISC_REASON}"
+	}
+}

@@ -1,0 +1,14 @@
+**/bin/
+**/obj/
+*.pdb
+
+# Local build/package folders. Use GitHub releases for compiled plugin zips.
+/ConnectAnnounce/
+/deploy/
+/release/
+
+# Legacy SourceMod plugin source kept locally as porting reference.
+/sourcemod/
+
+# GeoLite2 downloads are generated outside this repo and must be kept updated.
+GeoLite2-City.mmdb
