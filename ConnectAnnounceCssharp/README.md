@@ -22,8 +22,6 @@ The release zip includes `GeoLite2-City.mmdb`, so it can be installed directly. 
 - https://git.io/GeoLite2-City.mmdb
 - https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-City.mmdb
 
-MaxMind documents that GeoLite downloads require a MaxMind account and license key, and that GeoLite databases must be kept up to date.
-
 ## Files
 
 - `ConnectAnnounce.dll`

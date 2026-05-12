@@ -27,8 +27,6 @@ The release zip includes `GeoLite2-City.mmdb`, so it can be installed directly. 
 csgo/addons/counterstrikesharp/plugins/ConnectAnnounce/GeoLite2-City.mmdb
 ```
 
-MaxMind documents that GeoLite downloads require a MaxMind account and license key, and that GeoLite databases must be kept up to date.
-
 ## Files
 
 - `ConnectAnnounce.dll`
