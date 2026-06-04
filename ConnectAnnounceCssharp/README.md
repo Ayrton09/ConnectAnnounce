@@ -10,6 +10,8 @@ Copy the complete `ConnectAnnounce` folder to:
 csgo/addons/counterstrikesharp/plugins/ConnectAnnounce/
 ```
 
+Do not upload only `ConnectAnnounce.dll`. `ConnectAnnounce.deps.json` must stay next to the DLL or CounterStrikeSharp cannot resolve the plugin dependencies.
+
 The release zip includes `GeoLite2-City.mmdb`, so it can be installed directly. To update the database later, download it from one of these links and replace the file in the plugin folder:
 
 - https://git.io/GeoLite2-City.mmdb

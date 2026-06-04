@@ -9,6 +9,7 @@ using CounterStrikeSharp.API.Modules.Admin;
 using CounterStrikeSharp.API.Modules.Commands;
 using CounterStrikeSharp.API.Modules.Entities;
 using CounterStrikeSharp.API.Modules.Utils;
+using MaxMind.Db;
 using MaxMind.GeoIP2;
 using MaxMind.GeoIP2.Exceptions;
 using Microsoft.Extensions.Logging;
@@ -18,14 +19,17 @@ namespace ConnectAnnounceCssharp;
 [MinimumApiVersion(80)]
 public sealed class ConnectAnnouncePlugin : BasePlugin
 {
-    private const string Version = "1.0.0";
+    private const string Version = "1.0.1";
     private const ulong SteamId64Base = 76561197960265728UL;
 
     private readonly object _fileLock = new();
+    private readonly object _geoLock = new();
     private readonly HashSet<ulong> _announcedSteamIds = [];
     private ConnectAnnounceConfig _config = new();
     private KeyValuesNode _countryShow = new("CountryShow");
     private DatabaseReader? _geoReader;
+    private bool _geoLoadAttempted;
+    private bool _filesLoaded;
     private bool _mapChanging;
     private string _dataDirectory = "";
     private string _settingsPath = "";
@@ -40,11 +44,19 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
     {
         _dataDirectory = Path.Combine(ModuleDirectory, "data");
         _settingsPath = Path.Combine(_dataDirectory, "cannounce_settings.txt");
-        _configPath = Path.Combine(Server.GameDirectory, "csgo", "addons", "counterstrikesharp", "configs", "plugins", "ConnectAnnounce", "ConnectAnnounceConfig.json");
+        _configPath = Path.Combine(Server.GameDirectory, "addons", "counterstrikesharp", "configs", "plugins", "ConnectAnnounce", "ConnectAnnounceConfig.json");
 
-        Directory.CreateDirectory(_dataDirectory);
-        Directory.CreateDirectory(Path.GetDirectoryName(_configPath)!);
-        LoadAllFiles();
+        try
+        {
+            Directory.CreateDirectory(_dataDirectory);
+            Directory.CreateDirectory(Path.GetDirectoryName(_configPath)!);
+            LoadAllFiles();
+        }
+        catch (Exception ex)
+        {
+            _filesLoaded = false;
+            Logger.LogError(ex, "Connect Announce failed during startup. The plugin will stay loaded but announcements are disabled until css_ca_reload succeeds.");
+        }
 
         RegisterEventHandler<EventPlayerConnect>(OnPlayerConnectPre, HookMode.Pre);
         RegisterEventHandler<EventPlayerDisconnect>(OnPlayerDisconnectPre, HookMode.Pre);
@@ -64,7 +76,6 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
 
     private void OnMapStart(string mapName)
     {
-        LoadAllFiles();
         AddTimer(15.0f, () => _mapChanging = false);
     }
 
@@ -75,6 +86,11 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
 
     private HookResult OnPlayerConnectPre(EventPlayerConnect @event, GameEventInfo info)
     {
+        if (!_filesLoaded)
+        {
+            return HookResult.Continue;
+        }
+
         if (!_config.ShowStandardConnectMessage)
         {
             info.DontBroadcast = true;
@@ -85,6 +101,11 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
 
     private void OnClientAuthorized(int playerSlot, SteamID steamId)
     {
+        if (!_filesLoaded)
+        {
+            return;
+        }
+
         var player = Utilities.GetPlayerFromSlot(playerSlot);
         if (!IsConnectingPlayer(player))
         {
@@ -107,6 +128,11 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
 
     private HookResult OnPlayerDisconnectPre(EventPlayerDisconnect @event, GameEventInfo info)
     {
+        if (!_filesLoaded)
+        {
+            return HookResult.Continue;
+        }
+
         if (!_config.ShowStandardDisconnectMessage)
         {
             info.DontBroadcast = true;
@@ -142,6 +168,12 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
 
     private void OnGeoListCommand(CCSPlayerController? caller, CommandInfo command)
     {
+        if (!_filesLoaded)
+        {
+            command.ReplyToCommand("[CA] Connect Announce files are not loaded. Fix the logged startup error and run css_ca_reload.");
+            return;
+        }
+
         if (command.ArgCount < 2)
         {
             command.ReplyToCommand("[CA] Usage: css_geolist <name, #userid, steamid, @me or @all>");
@@ -164,7 +196,9 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
         }
 
         LoadAllFiles();
-        command.ReplyToCommand("[CA] Reloaded Connect Announce configuration.");
+        command.ReplyToCommand(_filesLoaded
+            ? "[CA] Reloaded Connect Announce configuration."
+            : "[CA] Reload failed. Check the server log for the exact error.");
     }
 
     private void PrintEnhancedMessage(CCSPlayerController subject, string playerMessage, string adminMessage, string? steamKey = null, string? disconnectReason = null)
@@ -268,9 +302,62 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
     {
         lock (_fileLock)
         {
-            LoadConfig();
-            LoadCountryMessages();
-            LoadGeoDatabase();
+            try
+            {
+                LoadConfig();
+                LoadCountryMessages();
+                ResetGeoDatabase();
+                LoadGeoDatabase();
+                _filesLoaded = true;
+            }
+            catch (Exception ex)
+            {
+                _filesLoaded = false;
+                Logger.LogError(ex, "Connect Announce could not load its files.");
+            }
+        }
+    }
+
+    private void LoadGeoDatabase()
+    {
+        lock (_geoLock)
+        {
+            if (_geoReader != null || _geoLoadAttempted)
+            {
+                return;
+            }
+
+            _geoLoadAttempted = true;
+            var mmdb = Path.IsPathRooted(_config.GeoLiteDatabasePath)
+                ? _config.GeoLiteDatabasePath
+                : Path.Combine(ModuleDirectory, _config.GeoLiteDatabasePath);
+            if (!File.Exists(mmdb))
+            {
+                Logger.LogWarning("GeoLite2 database was not found at {Path}. GeoIP placeholders will use unknown values.", mmdb);
+                return;
+            }
+
+            try
+            {
+                _geoReader = new DatabaseReader(mmdb, FileAccessMode.Memory);
+                Logger.LogInformation("Loaded GeoLite2 database from {Path}", mmdb);
+            }
+            catch (Exception ex)
+            {
+                _geoReader?.Dispose();
+                _geoReader = null;
+                Logger.LogError(ex, "GeoLite2 database could not be loaded from {Path}. GeoIP placeholders will use unknown values.", mmdb);
+            }
+        }
+    }
+
+    private void ResetGeoDatabase()
+    {
+        lock (_geoLock)
+        {
+            _geoReader?.Dispose();
+            _geoReader = null;
+            _geoLoadAttempted = false;
         }
     }
 
@@ -329,24 +416,6 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
         _countryShow = KeyValuesParser.Parse(File.ReadAllText(_settingsPath));
         EnsureDefaultCountryMessages();
         File.WriteAllText(_settingsPath, KeyValuesSerializer.Serialize(_countryShow));
-    }
-
-    private void LoadGeoDatabase()
-    {
-        _geoReader?.Dispose();
-        _geoReader = null;
-
-        var mmdb = Path.IsPathRooted(_config.GeoLiteDatabasePath)
-            ? _config.GeoLiteDatabasePath
-            : Path.Combine(ModuleDirectory, _config.GeoLiteDatabasePath);
-        if (!File.Exists(mmdb))
-        {
-            Logger.LogWarning("GeoLite2 database was not found at {Path}. GeoIP placeholders will use unknown values.", mmdb);
-            return;
-        }
-
-        _geoReader = new DatabaseReader(mmdb);
-        Logger.LogInformation("Loaded GeoLite2 database from {Path}", mmdb);
     }
 
     private string GetCountryMessage(string sectionName, string key)
