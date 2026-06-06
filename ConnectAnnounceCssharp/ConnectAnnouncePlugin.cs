@@ -34,7 +34,6 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
     private string _dataDirectory = "";
     private string _settingsPath = "";
     private string _configPath = "";
-    private string _legacyConfigPath = "";
 
     public override string ModuleName => "Connect Announce";
     public override string ModuleVersion => Version;
@@ -46,7 +45,6 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
         _dataDirectory = Path.Combine(ModuleDirectory, "data");
         _settingsPath = Path.Combine(_dataDirectory, "cannounce_settings.txt");
         _configPath = Path.Combine(GetCounterStrikeSharpConfigsPath(), "plugins", "ConnectAnnounce", "ConnectAnnounceConfig.json");
-        _legacyConfigPath = Path.Combine(Server.GameDirectory, "addons", "counterstrikesharp", "configs", "plugins", "ConnectAnnounce", "ConnectAnnounceConfig.json");
 
         try
         {
@@ -365,8 +363,6 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
 
     private void LoadConfig()
     {
-        MigrateLegacyConfig();
-
         if (!File.Exists(_configPath))
         {
             _config = new ConnectAnnounceConfig();
@@ -378,26 +374,11 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
         var json = File.ReadAllText(_configPath);
         _config = JsonSerializer.Deserialize<ConnectAnnounceConfig>(json, JsonOptions) ?? new ConnectAnnounceConfig();
         ValidateConfigColors();
-        WriteConfig();
     }
 
     private void WriteConfig()
     {
         File.WriteAllText(_configPath, JsonSerializer.Serialize(_config, JsonOptions));
-    }
-
-    private void MigrateLegacyConfig()
-    {
-        if (string.IsNullOrWhiteSpace(_legacyConfigPath) ||
-            string.Equals(_legacyConfigPath, _configPath, StringComparison.OrdinalIgnoreCase) ||
-            File.Exists(_configPath) ||
-            !File.Exists(_legacyConfigPath))
-        {
-            return;
-        }
-
-        File.Copy(_legacyConfigPath, _configPath);
-        Logger.LogInformation("Migrated Connect Announce configuration from legacy path {LegacyPath} to {ConfigPath}", _legacyConfigPath, _configPath);
     }
 
     private static string GetCounterStrikeSharpConfigsPath()
@@ -450,7 +431,6 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
 
         _countryShow = KeyValuesParser.Parse(File.ReadAllText(_settingsPath));
         EnsureDefaultCountryMessages();
-        File.WriteAllText(_settingsPath, KeyValuesSerializer.Serialize(_countryShow));
     }
 
     private string GetCountryMessage(string sectionName, string key)
