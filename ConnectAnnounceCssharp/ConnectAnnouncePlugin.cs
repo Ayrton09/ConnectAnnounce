@@ -19,7 +19,7 @@ namespace ConnectAnnounceCssharp;
 [MinimumApiVersion(80)]
 public sealed class ConnectAnnouncePlugin : BasePlugin
 {
-    private const string Version = "1.0.1";
+    private const string Version = "1.0.2";
     private const ulong SteamId64Base = 76561197960265728UL;
 
     private readonly object _fileLock = new();
@@ -34,6 +34,7 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
     private string _dataDirectory = "";
     private string _settingsPath = "";
     private string _configPath = "";
+    private string _legacyConfigPath = "";
 
     public override string ModuleName => "Connect Announce";
     public override string ModuleVersion => Version;
@@ -44,7 +45,8 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
     {
         _dataDirectory = Path.Combine(ModuleDirectory, "data");
         _settingsPath = Path.Combine(_dataDirectory, "cannounce_settings.txt");
-        _configPath = Path.Combine(Server.GameDirectory, "addons", "counterstrikesharp", "configs", "plugins", "ConnectAnnounce", "ConnectAnnounceConfig.json");
+        _configPath = Path.Combine(GetCounterStrikeSharpConfigsPath(), "plugins", "ConnectAnnounce", "ConnectAnnounceConfig.json");
+        _legacyConfigPath = Path.Combine(Server.GameDirectory, "addons", "counterstrikesharp", "configs", "plugins", "ConnectAnnounce", "ConnectAnnounceConfig.json");
 
         try
         {
@@ -363,6 +365,8 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
 
     private void LoadConfig()
     {
+        MigrateLegacyConfig();
+
         if (!File.Exists(_configPath))
         {
             _config = new ConnectAnnounceConfig();
@@ -380,6 +384,37 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
     private void WriteConfig()
     {
         File.WriteAllText(_configPath, JsonSerializer.Serialize(_config, JsonOptions));
+    }
+
+    private void MigrateLegacyConfig()
+    {
+        if (string.IsNullOrWhiteSpace(_legacyConfigPath) ||
+            string.Equals(_legacyConfigPath, _configPath, StringComparison.OrdinalIgnoreCase) ||
+            File.Exists(_configPath) ||
+            !File.Exists(_legacyConfigPath))
+        {
+            return;
+        }
+
+        File.Copy(_legacyConfigPath, _configPath);
+        Logger.LogInformation("Migrated Connect Announce configuration from legacy path {LegacyPath} to {ConfigPath}", _legacyConfigPath, _configPath);
+    }
+
+    private static string GetCounterStrikeSharpConfigsPath()
+    {
+        var apiDirectory = Path.GetDirectoryName(typeof(BasePlugin).Assembly.Location);
+        if (string.IsNullOrWhiteSpace(apiDirectory))
+        {
+            throw new InvalidOperationException("CounterStrikeSharp API directory could not be resolved.");
+        }
+
+        var rootDirectory = Directory.GetParent(apiDirectory)?.FullName;
+        if (string.IsNullOrWhiteSpace(rootDirectory))
+        {
+            throw new InvalidOperationException($"CounterStrikeSharp root directory could not be resolved from '{apiDirectory}'.");
+        }
+
+        return Path.Combine(rootDirectory, "configs");
     }
 
     private void ValidateConfigColors()
