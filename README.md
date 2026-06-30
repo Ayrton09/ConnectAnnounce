@@ -61,8 +61,15 @@ Available placeholders:
 
 Configurable colors are stored in `ConnectAnnounceConfig.json`:
 
+### Admin announcements
+
+`ShowEnhancedToAdmins` controls how admins are announced. When `true` and the connecting/disconnecting player is an admin, **everyone** on the server sees the `messages_admin` block instead of the normal `messages` block, so the whole server knows an admin joined or left. Regular players are always announced with `messages`.
+
+Which players count as "admin" is controlled by `AdminFlag` in `ConnectAnnounceConfig.json` (default `@css/generic`). Set it to whatever flag your admins actually have, e.g. `@css/ban`. Players with `@css/root` always count as admin. This flag also drives the `{PLAYERTYPE}` placeholder.
+
 ```json
 {
+  "AdminFlag": "@css/generic",
   "PlayerNameColor": "Purple",
   "SteamIdColor": "Default",
   "LocationColor": "Green",

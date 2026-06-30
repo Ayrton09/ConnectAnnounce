@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Net;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using CounterStrikeSharp.API;
 using CounterStrikeSharp.API.Core;
 using CounterStrikeSharp.API.Core.Attributes;
@@ -19,8 +20,9 @@ namespace ConnectAnnounceCssharp;
 [MinimumApiVersion(80)]
 public sealed class ConnectAnnouncePlugin : BasePlugin
 {
-    private const string Version = "1.0.2";
+    private const string Version = "1.0.3";
     private const ulong SteamId64Base = 76561197960265728UL;
+    private static readonly Regex PlaceholderPattern = new(@"\{[A-Za-z0-9_]+\}", RegexOptions.Compiled);
 
     private readonly object _fileLock = new();
     private readonly object _geoLock = new();
@@ -120,9 +122,10 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
         var steamKey = GetSteamKey(steamId);
         if (_config.ShowEnhancedConnectMessage)
         {
+            var subjectIsAdmin = IsAdmin(steamId);
             var playerMsg = GetCountryMessage("messages", "playerjoin");
             var adminMsg = GetCountryMessage("messages_admin", "playerjoin");
-            PrintEnhancedMessage(player!, playerMsg, adminMsg, steamKey);
+            PrintEnhancedMessage(player!, subjectIsAdmin, playerMsg, adminMsg, steamKey);
         }
     }
 
@@ -144,23 +147,29 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
             return HookResult.Continue;
         }
 
+        // Map-transition disconnects are not real departures: a player who stays
+        // through a map change fires a synthetic disconnect and is re-authorized on
+        // the next map. We must NOT clear their dedup entry here, otherwise the
+        // re-auth would re-announce every persisting player as a fresh connect. So
+        // the early-return stays BEFORE the dedup cleanup.
         if (_mapChanging || IsMapTransitionDisconnectReason(@event.Reason))
         {
             return HookResult.Continue;
         }
 
-        var steam64 = player!.AuthorizedSteamID?.SteamId64;
-        if (steam64.HasValue)
+        var steamId = player!.AuthorizedSteamID;
+        if (steamId != null)
         {
-            _announcedSteamIds.Remove(steam64.Value);
+            _announcedSteamIds.Remove(steamId.SteamId64);
         }
 
         if (_config.ShowEnhancedDisconnectMessage)
         {
+            var subjectIsAdmin = IsAdmin(steamId);
             var reason = GetDisconnectReason(@event.Reason);
             var playerMsg = GetCountryMessage("messages", "playerdisc");
             var adminMsg = GetCountryMessage("messages_admin", "playerdisc");
-            PrintEnhancedMessage(player!, playerMsg, adminMsg, disconnectReason: reason);
+            PrintEnhancedMessage(player!, subjectIsAdmin, playerMsg, adminMsg, disconnectReason: reason);
         }
 
         return HookResult.Continue;
@@ -201,28 +210,19 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
             : "[CA] Reload failed. Check the server log for the exact error.");
     }
 
-    private void PrintEnhancedMessage(CCSPlayerController subject, string playerMessage, string adminMessage, string? steamKey = null, string? disconnectReason = null)
+    private void PrintEnhancedMessage(CCSPlayerController subject, bool subjectIsAdmin, string playerMessage, string adminMessage, string? steamKey = null, string? disconnectReason = null)
     {
-        if (_config.ShowEnhancedToAdmins)
+        // When the connecting/disconnecting player is an admin, the whole server
+        // sees the admin message so everyone knows an admin joined or left.
+        var useAdminMessage = _config.ShowEnhancedToAdmins && subjectIsAdmin;
+        var formatted = FormatMessage(useAdminMessage ? adminMessage : playerMessage, subject, subjectIsAdmin, steamKey, disconnectReason);
+        foreach (var player in GetRealPlayers())
         {
-            var formattedAdmin = FormatMessage(adminMessage, subject, steamKey, disconnectReason);
-            var formattedPublic = FormatMessage(playerMessage, subject, steamKey, disconnectReason);
-            foreach (var player in GetRealPlayers())
-            {
-                player.PrintToChat(" " + (HasPermission(player, "@css/generic") ? formattedAdmin : formattedPublic));
-            }
-        }
-        else
-        {
-            var formatted = FormatMessage(playerMessage, subject, steamKey, disconnectReason);
-            foreach (var player in GetRealPlayers())
-            {
-                player.PrintToChat(" " + formatted);
-            }
+            player.PrintToChat(" " + formatted);
         }
     }
 
-    private string FormatMessage(string rawMessage, CCSPlayerController? player, string? steamKeyOverride = null, string? disconnectReason = null)
+    private string FormatMessage(string rawMessage, CCSPlayerController? player, bool isAdmin, string? steamKeyOverride = null, string? disconnectReason = null)
     {
         var message = ApplyColorTags(rawMessage);
         if (player == null)
@@ -233,7 +233,7 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
         var ip = ExtractIp(player.IpAddress);
         var location = LookupLocation(player);
         var steamKey = steamKeyOverride ?? GetSteamKey(player) ?? "";
-        var playerType = HasPermission(player, "@css/generic") ? "Admin" : "Player";
+        var playerType = isAdmin ? "Admin" : "Player";
 
         var replacements = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
@@ -250,12 +250,10 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
             ["{DISC_REASON}"] = ChatColorTagExtensions.Colorize(_config.DisconnectReasonColor, disconnectReason ?? "")
         };
 
-        foreach (var replacement in replacements)
-        {
-            message = message.Replace(replacement.Key, replacement.Value, StringComparison.OrdinalIgnoreCase);
-        }
-
-        return message;
+        // Single pass over the template: substituted values are never re-scanned,
+        // so a player whose name contains a token like {PLAYERIP} cannot inject it.
+        return PlaceholderPattern.Replace(message, match =>
+            replacements.TryGetValue(match.Value, out var value) ? value : match.Value);
     }
 
     private GeoLocation LookupLocation(CCSPlayerController player)
@@ -294,6 +292,11 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
         catch (GeoIP2Exception ex)
         {
             Logger.LogWarning(ex, "GeoIP lookup failed for {Ip}", ipText);
+            return GeoLocation.Unknown;
+        }
+        catch (InvalidDatabaseException ex)
+        {
+            Logger.LogWarning(ex, "GeoLite2 database is corrupt while looking up {Ip}", ipText);
             return GeoLocation.Unknown;
         }
     }
@@ -374,6 +377,11 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
         var json = File.ReadAllText(_configPath);
         _config = JsonSerializer.Deserialize<ConnectAnnounceConfig>(json, JsonOptions) ?? new ConnectAnnounceConfig();
         ValidateConfigColors();
+
+        // The config is never rewritten on load. Missing keys fall back to their
+        // defaults in memory, so the plugin works fine without touching the file.
+        // To pick up keys added in a newer version, delete the file and let it
+        // regenerate, or add the key by hand.
     }
 
     private void WriteConfig()
@@ -465,12 +473,14 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
     private static KeyValuesNode DefaultCountryShow()
     {
         var root = new KeyValuesNode("CountryShow");
-        foreach (var sectionName in new[] { "messages", "messages_admin" })
-        {
-            var section = root.GetOrAddChild(sectionName);
-            section.SetValue("playerjoin", "{PLAYERNAME} connected from {PLAYERCOUNTRY} | {PLAYERCITY}");
-            section.SetValue("playerdisc", "{PLAYERNAME} ({STEAMID}) disconnected! {DISC_REASON_LABEL}{DISC_REASON}");
-        }
+
+        var messages = root.GetOrAddChild("messages");
+        messages.SetValue("playerjoin", "{PLAYERNAME} connected from {PLAYERCOUNTRY} | {PLAYERCITY}");
+        messages.SetValue("playerdisc", "{PLAYERNAME} ({STEAMID}) disconnected! {DISC_REASON_LABEL}{DISC_REASON}");
+
+        var messagesAdmin = root.GetOrAddChild("messages_admin");
+        messagesAdmin.SetValue("playerjoin", "{Red}[ADMIN] {PLAYERNAME} connected from {PLAYERCOUNTRY} | {PLAYERCITY}");
+        messagesAdmin.SetValue("playerdisc", "{Red}[ADMIN] {PLAYERNAME} disconnected! {DISC_REASON_LABEL}{DISC_REASON}");
 
         return root;
     }
@@ -494,6 +504,23 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
         return player == null ||
                AdminManager.PlayerHasPermissions(player, "@css/root") ||
                AdminManager.PlayerHasPermissions(player, permission);
+    }
+
+    // Resolve admin status from the SteamID, not the controller. The controller
+    // overload of PlayerHasPermissions returns false unless the player is already
+    // in the Connected state, which is NOT guaranteed at OnClientAuthorized time,
+    // so a connecting admin would otherwise be announced as a normal player. The
+    // SteamID overload has no such guard and admin data is keyed by SteamID.
+    private bool IsAdmin(SteamID? steamId)
+    {
+        if (steamId == null)
+        {
+            return false;
+        }
+
+        var flag = string.IsNullOrWhiteSpace(_config.AdminFlag) ? "@css/generic" : _config.AdminFlag;
+        return AdminManager.PlayerHasPermissions(steamId, "@css/root") ||
+               AdminManager.PlayerHasPermissions(steamId, flag);
     }
 
     private IEnumerable<CCSPlayerController> FindTargets(CCSPlayerController? caller, string pattern)
@@ -730,7 +757,8 @@ public sealed record ConnectAnnounceConfig
 {
     public bool ShowEnhancedConnectMessage { get; init; } = true;
     public bool ShowEnhancedDisconnectMessage { get; init; } = true;
-    public bool ShowEnhancedToAdmins { get; init; }
+    public bool ShowEnhancedToAdmins { get; init; } = true;
+    public string AdminFlag { get; init; } = "@css/generic";
     public bool ShowStandardConnectMessage { get; init; }
     public bool ShowStandardDisconnectMessage { get; init; }
     public string GeoLiteDatabasePath { get; init; } = "GeoLite2-City.mmdb";

@@ -7,7 +7,7 @@
 	}
 	"messages_admin"
 	{
-		"playerjoin"		"{PLAYERNAME} connected from {PLAYERCOUNTRY} | {PLAYERCITY}"
-		"playerdisc"		"{PLAYERNAME} ({STEAMID}) disconnected! {DISC_REASON_LABEL}{DISC_REASON}"
+		"playerjoin"		"{Red}[ADMIN] {PLAYERNAME} connected from {PLAYERCOUNTRY} | {PLAYERCITY}"
+		"playerdisc"		"{Red}[ADMIN] {PLAYERNAME} disconnected! {DISC_REASON_LABEL}{DISC_REASON}"
 	}
 }
