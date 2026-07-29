@@ -17,22 +17,48 @@ using Microsoft.Extensions.Logging;
 
 namespace ConnectAnnounceCssharp;
 
-[MinimumApiVersion(80)]
+// Matches the requirement stated in the README. CounterStrikeSharp compares this against
+// its own build number, so an older server refuses the plugin with a clear message instead
+// of loading it and failing later on an API that does not exist there.
+[MinimumApiVersion(371)]
 public sealed class ConnectAnnouncePlugin : BasePlugin
 {
-    private const string Version = "1.0.3";
+    private const string Version = "1.0.4";
     private const ulong SteamId64Base = 76561197960265728UL;
     private static readonly Regex PlaceholderPattern = new(@"\{[A-Za-z0-9_]+\}", RegexOptions.Compiled);
 
     private readonly object _fileLock = new();
     private readonly object _geoLock = new();
-    private readonly HashSet<ulong> _announcedSteamIds = [];
+    // When each player was last seen arriving or leaving transiently. A reconnect inside
+    // this window is treated as the same arrival (map change, or a forced addon-download
+    // reconnect loop) and is not announced again; a player returning after it is a genuine
+    // new arrival. Because the entry ages out on its own, a player who leaves for good can
+    // never get stuck permanently un-announceable, which is what keying on "is this player
+    // still connected" used to cause.
+    // The window covers a single reconnect hop rather than a whole download chain: every
+    // hop stamps the entry again, so five minutes is generous.
+    private static readonly TimeSpan AnnounceWindow = TimeSpan.FromMinutes(5);
+    private readonly Dictionary<ulong, DateTime> _lastSeenAt = [];
+
+    // Last SteamID seen on each slot. AuthorizedSteamID stops resolving on a controller
+    // that is being torn down, which is exactly when the disconnect path needs it, so keep
+    // our own copy from authorization time. Paired with the UserId of the connection it was
+    // recorded for, because slots are reused: without that check a client that disconnects
+    // before authorizing would resolve to whoever held the slot last. Bounded by slot count.
+    private readonly Dictionary<int, (int UserId, ulong Steam64)> _slotSteamIds = [];
     private ConnectAnnounceConfig _config = new();
     private KeyValuesNode _countryShow = new("CountryShow");
     private DatabaseReader? _geoReader;
     private bool _geoLoadAttempted;
     private bool _filesLoaded;
     private bool _mapChanging;
+
+    // Clients that fail to load the new map drop shortly after it starts, with ordinary
+    // reasons like "Timed out" that are indistinguishable from a real departure. Treat
+    // the first moments of a map as still transitioning so those are not announced as
+    // arrivals and departures. Replaces a timer that used to clear _mapChanging late.
+    private static readonly TimeSpan MapSettleWindow = TimeSpan.FromSeconds(15);
+    private DateTime _mapStartedAt = DateTime.MinValue;
     private string _dataDirectory = "";
     private string _settingsPath = "";
     private string _configPath = "";
@@ -40,16 +66,19 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
     public override string ModuleName => "Connect Announce";
     public override string ModuleVersion => Version;
     public override string ModuleAuthor => "Ayrton09";
-    public override string ModuleDescription => string.Empty;
+    public override string ModuleDescription => "Custom connect and disconnect announcements with GeoIP location.";
 
     public override void Load(bool hotReload)
     {
-        _dataDirectory = Path.Combine(ModuleDirectory, "data");
-        _settingsPath = Path.Combine(_dataDirectory, "cannounce_settings.txt");
-        _configPath = Path.Combine(GetCounterStrikeSharpConfigsPath(), "plugins", "ConnectAnnounce", "ConnectAnnounceConfig.json");
-
+        // Everything that can throw stays inside the try, including resolving the config
+        // path. If it escaped, the handlers and css_ca_reload below would never register
+        // and there would be no way to recover without restarting the server.
         try
         {
+            _dataDirectory = Path.Combine(ModuleDirectory, "data");
+            _settingsPath = Path.Combine(_dataDirectory, "cannounce_settings.txt");
+            _configPath = Path.Combine(GetCounterStrikeSharpConfigsPath(), "plugins", "ConnectAnnounce", "ConnectAnnounceConfig.json");
+
             Directory.CreateDirectory(_dataDirectory);
             Directory.CreateDirectory(Path.GetDirectoryName(_configPath)!);
             LoadAllFiles();
@@ -72,18 +101,102 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
 
     public override void Unload(bool hotReload)
     {
-        _geoReader?.Dispose();
-        _geoReader = null;
+        // Same lock as every other write to the reader; reads take a local snapshot.
+        lock (_geoLock)
+        {
+            _geoReader?.Dispose();
+            _geoReader = null;
+        }
     }
 
     private void OnMapStart(string mapName)
     {
-        AddTimer(15.0f, () => _mapChanging = false);
+        _mapChanging = false;
+        _mapStartedAt = DateTime.UtcNow;
+
+        // Drop entries that have aged out. Players who stayed are normally stamped in
+        // OnMapEnd and by their transition disconnect, so this should only reach players
+        // who are gone. If both of those miss someone who is still here, the cost is one
+        // extra arrival announcement for them; nothing breaks.
+        var cutoff = DateTime.UtcNow - AnnounceWindow;
+        foreach (var steam64 in _lastSeenAt.Where(entry => entry.Value < cutoff).Select(entry => entry.Key).ToList())
+        {
+            _lastSeenAt.Remove(steam64);
+        }
     }
 
     private void OnMapEnd()
     {
         _mapChanging = true;
+
+        // Stamp everyone who is still here, while the controllers are still healthy. The
+        // map change drops and re-authorizes them, and that re-authorization must land
+        // inside the announce window or they get announced again as if they had just
+        // arrived. This is the first of two layers; the transient-disconnect refresh is
+        // the second, so suppression survives either one missing a player.
+
+        // Resolve the list inside its own guard: the filter reads entity state during
+        // enumeration, so a controller already tearing down can throw there rather than
+        // in the loop body.
+        List<CCSPlayerController> players;
+        try
+        {
+            players = GetRealPlayers().ToList();
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Could not list players before the map change.");
+            return;
+        }
+
+        var now = DateTime.UtcNow;
+        foreach (var player in players)
+        {
+            // One controller that is already tearing down must not abort the loop and
+            // leave everyone after it unstamped.
+            try
+            {
+                var steam64 = ResolveSteamId(player);
+                if (steam64.HasValue)
+                {
+                    _lastSeenAt[steam64.Value] = now;
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning(ex, "Could not record a player before the map change.");
+            }
+        }
+    }
+
+    // AuthorizedSteamID can stop resolving on a controller that is going away, so fall
+    // back to what we recorded for that slot when the player authorized. The cached entry
+    // is only trusted when it belongs to this same connection: slots get reused, and a
+    // client that disconnects before authorizing would otherwise be reported under the
+    // previous occupant's SteamID.
+    private ulong? ResolveSteamId(CCSPlayerController player)
+    {
+        ulong? steam64;
+        try
+        {
+            steam64 = player.AuthorizedSteamID?.SteamId64;
+        }
+        catch (Exception)
+        {
+            // Reading it off a controller that is going away can throw rather than return
+            // null. That is exactly the case the cache below exists for, so fall through
+            // instead of losing the announcement.
+            steam64 = null;
+        }
+
+        if (steam64.HasValue)
+        {
+            return steam64;
+        }
+
+        return _slotSteamIds.TryGetValue(player.Slot, out var cached) && cached.UserId == player.UserId
+            ? cached.Steam64
+            : null;
     }
 
     private HookResult OnPlayerConnectPre(EventPlayerConnect @event, GameEventInfo info)
@@ -103,6 +216,21 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
 
     private void OnClientAuthorized(int playerSlot, SteamID steamId)
     {
+        // This runs while a client is still joining, reading entity state that can go away
+        // underneath it. Nothing here is worth letting an exception escape into the
+        // framework's listener dispatch over.
+        try
+        {
+            AnnounceAuthorizedPlayer(playerSlot, steamId);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Could not announce a connecting player.");
+        }
+    }
+
+    private void AnnounceAuthorizedPlayer(int playerSlot, SteamID steamId)
+    {
         if (!_filesLoaded)
         {
             return;
@@ -114,7 +242,20 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
             return;
         }
 
-        if (!_announcedSteamIds.Add(steamId.SteamId64))
+        // Refresh the timestamp on every authorization, including suppressed ones, so a
+        // long chain of reconnects keeps sliding the window instead of ageing out midway
+        // and announcing the same arrival twice.
+        var steam64 = steamId.SteamId64;
+        if (player!.UserId is { } userId)
+        {
+            _slotSteamIds[playerSlot] = (userId, steam64);
+        }
+
+        var now = DateTime.UtcNow;
+        var alreadyAnnounced = _lastSeenAt.TryGetValue(steam64, out var lastAnnounced) &&
+                               now - lastAnnounced < AnnounceWindow;
+        _lastSeenAt[steam64] = now;
+        if (alreadyAnnounced)
         {
             return;
         }
@@ -141,38 +282,73 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
             info.DontBroadcast = true;
         }
 
-        var player = @event.Userid;
-        if (!IsRealPlayer(player))
+        // Everything past this point reads a controller that is on its way out. Suppressing
+        // the stock message above already happened, so a failure here must not change the
+        // hook's result.
+        try
         {
-            return HookResult.Continue;
+            AnnounceDisconnectingPlayer(@event);
         }
-
-        // Map-transition disconnects are not real departures: a player who stays
-        // through a map change fires a synthetic disconnect and is re-authorized on
-        // the next map. We must NOT clear their dedup entry here, otherwise the
-        // re-auth would re-announce every persisting player as a fresh connect. So
-        // the early-return stays BEFORE the dedup cleanup.
-        if (_mapChanging || IsMapTransitionDisconnectReason(@event.Reason))
+        catch (Exception ex)
         {
-            return HookResult.Continue;
-        }
-
-        var steamId = player!.AuthorizedSteamID;
-        if (steamId != null)
-        {
-            _announcedSteamIds.Remove(steamId.SteamId64);
-        }
-
-        if (_config.ShowEnhancedDisconnectMessage)
-        {
-            var subjectIsAdmin = IsAdmin(steamId);
-            var reason = GetDisconnectReason(@event.Reason);
-            var playerMsg = GetCountryMessage("messages", "playerdisc");
-            var adminMsg = GetCountryMessage("messages_admin", "playerdisc");
-            PrintEnhancedMessage(player!, subjectIsAdmin, playerMsg, adminMsg, disconnectReason: reason);
+            Logger.LogWarning(ex, "Could not announce a disconnecting player.");
         }
 
         return HookResult.Continue;
+    }
+
+    private void AnnounceDisconnectingPlayer(EventPlayerDisconnect @event)
+    {
+        var player = @event.Userid;
+        if (!IsRealPlayer(player))
+        {
+            return;
+        }
+
+        var steam64 = ResolveSteamId(player!);
+
+        // Transient disconnects are not real departures: the player is re-authorized right
+        // afterwards (map change, or an addon-download reconnect loop). Slide their entry
+        // forward so that re-authorization lands inside the announce window instead of
+        // looking like a new arrival. Written unconditionally rather than only refreshing
+        // an existing entry, so it still holds if the sweep already removed it.
+        var settling = DateTime.UtcNow - _mapStartedAt < MapSettleWindow;
+        if (_mapChanging || settling || IsTransientDisconnectReason(@event.Reason))
+        {
+            if (steam64.HasValue)
+            {
+                _lastSeenAt[steam64.Value] = DateTime.UtcNow;
+            }
+
+            return;
+        }
+
+        // A resolvable SteamID is what separates a real departure from a client that was
+        // rejected before it ever authorized (banned, VAC, server full). Those have no
+        // SteamID and would otherwise produce a "disconnected" line with a blank one and
+        // no matching arrival. Deliberately not also requiring a _lastSeenAt entry: after
+        // a plugin reload the table is empty, and everyone already on the server would
+        // then leave silently.
+        if (!steam64.HasValue)
+        {
+            return;
+        }
+
+        _lastSeenAt.Remove(steam64.Value);
+        _slotSteamIds.Remove(player!.Slot);
+
+        if (_config.ShowEnhancedDisconnectMessage)
+        {
+            // Resolve both from our own copy of the SteamID: reading it off a controller
+            // that is going away can come back empty, which would render the message with
+            // a blank {STEAMID} and announce an admin as an ordinary player.
+            var subjectIsAdmin = IsAdmin(new SteamID(steam64.Value));
+            var steamKey = ToSteam2(steam64.Value, universe: 1);
+            var reason = GetDisconnectReason(@event.Reason);
+            var playerMsg = GetCountryMessage("messages", "playerdisc");
+            var adminMsg = GetCountryMessage("messages_admin", "playerdisc");
+            PrintEnhancedMessage(player!, subjectIsAdmin, playerMsg, adminMsg, steamKey, reason);
+        }
     }
 
     private void OnGeoListCommand(CCSPlayerController? caller, CommandInfo command)
@@ -189,7 +365,20 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
             return;
         }
 
-        foreach (var target in FindTargets(caller, command.ArgByIndex(1)))
+        var pattern = command.ArgByIndex(1);
+        var targets = FindTargets(caller, pattern).ToList();
+        if (targets.Count == 0)
+        {
+            command.ReplyToCommand($"[CA] No players matched '{pattern}'.");
+            return;
+        }
+
+        if (_geoReader == null)
+        {
+            command.ReplyToCommand("[CA] No GeoLite2 database is loaded, so locations will be unknown.");
+        }
+
+        foreach (var target in targets)
         {
             var location = LookupLocation(target);
             command.ReplyToCommand($"{target.PlayerName} from {location.City} in {location.Region}/{location.Country}");
@@ -215,11 +404,57 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
         // When the connecting/disconnecting player is an admin, the whole server
         // sees the admin message so everyone knows an admin joined or left.
         var useAdminMessage = _config.ShowEnhancedToAdmins && subjectIsAdmin;
+
+        // Format now, while the subject is still around to read from.
         var formatted = FormatMessage(useAdminMessage ? adminMessage : playerMessage, subject, subjectIsAdmin, steamKey, disconnectReason);
-        foreach (var player in GetRealPlayers())
+
+        // Capture the logger rather than reaching for the property from inside the
+        // callback, so the closure does not hold on to the plugin instance.
+        var logger = Logger;
+
+        // Defer the broadcast so it never runs while a connect or disconnect is still being
+        // processed, and resolve the recipients inside the callback so the list reflects who
+        // is on the server at send time. NextWorldUpdate rather than NextFrame because
+        // NextFrame does not run while the server is hibernating.
+        Server.NextWorldUpdate(() =>
         {
-            player.PrintToChat(" " + formatted);
-        }
+            // The recipient limit is the engine's, not the configured slot count.
+            const int recipientLimit = 64;
+
+            // Resolve the list inside its own guard. GetRealPlayers is lazy and its filter
+            // reads entity state, so a player going away can throw while the list is being
+            // enumerated, not only when the message is sent.
+            List<CCSPlayerController> recipients;
+            try
+            {
+                recipients = GetRealPlayers().ToList();
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "Could not resolve announcement recipients.");
+                return;
+            }
+
+            // One stale recipient must not swallow the message for everyone after them.
+            foreach (var player in recipients)
+            {
+                try
+                {
+                    // The engine native behind PrintToChat sets a raw slot in a recipient
+                    // bit vector with no bounds check of its own, so validate it here.
+                    if (player.Slot < 0 || player.Slot >= recipientLimit)
+                    {
+                        continue;
+                    }
+
+                    player.PrintToChat(" " + formatted);
+                }
+                catch (Exception ex)
+                {
+                    logger.LogWarning(ex, "Could not deliver an announcement to a player.");
+                }
+            }
+        });
     }
 
     private string FormatMessage(string rawMessage, CCSPlayerController? player, bool isAdmin, string? steamKeyOverride = null, string? disconnectReason = null)
@@ -230,8 +465,10 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
             return message;
         }
 
+        // Read the address once and reuse it: every property read on a controller is a
+        // native round-trip, and this runs inside the connect/disconnect path.
         var ip = ExtractIp(player.IpAddress);
-        var location = LookupLocation(player);
+        var location = LookupLocation(ip);
         var steamKey = steamKeyOverride ?? GetSteamKey(player) ?? "";
         var playerType = isAdmin ? "Admin" : "Player";
 
@@ -239,7 +476,7 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
         {
             ["{PLAYERNAME}"] = ChatColorTagExtensions.Colorize(_config.PlayerNameColor, player.PlayerName),
             ["{STEAMID}"] = ChatColorTagExtensions.Colorize(_config.SteamIdColor, steamKey),
-            ["{PLAYERCOUNTRY}"] = ChatColorTagExtensions.Colorize(_config.LocationColor, AddThePrefix(location.Country)),
+            ["{PLAYERCOUNTRY}"] = ChatColorTagExtensions.Colorize(_config.LocationColor, AddThePrefix(location.Country, location.CountryCode2)),
             ["{PLAYERCOUNTRYSHORT}"] = ChatColorTagExtensions.Colorize(_config.LocationColor, location.CountryCode2),
             ["{PLAYERCOUNTRYSHORT3}"] = ChatColorTagExtensions.Colorize(_config.LocationColor, location.CountryCode3),
             ["{PLAYERCITY}"] = ChatColorTagExtensions.Colorize(_config.LocationColor, location.City),
@@ -258,7 +495,11 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
 
     private GeoLocation LookupLocation(CCSPlayerController player)
     {
-        var ipText = ExtractIp(player.IpAddress);
+        return LookupLocation(ExtractIp(player.IpAddress));
+    }
+
+    private GeoLocation LookupLocation(string ipText)
+    {
         if (!IPAddress.TryParse(ipText, out var address))
         {
             return GeoLocation.Unknown;
@@ -269,14 +510,18 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
             return GeoLocation.Lan;
         }
 
-        if (_geoReader == null)
+        // Read the field once so a reload cannot swap it midway through this method. This
+        // does not stop a reload disposing the reader we captured; that surfaces as a
+        // caught exception below and a single unknown location, which is acceptable.
+        var reader = _geoReader;
+        if (reader == null)
         {
             return GeoLocation.Unknown;
         }
 
         try
         {
-            var city = _geoReader.City(address);
+            var city = reader.City(address);
             var countryCode = city.Country.IsoCode ?? "";
             return new GeoLocation(
                 FirstEnglishName(city.City.Names, "Somewhere"),
@@ -299,12 +544,27 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
             Logger.LogWarning(ex, "GeoLite2 database is corrupt while looking up {Ip}", ipText);
             return GeoLocation.Unknown;
         }
+        catch (Exception ex)
+        {
+            // Nothing a lookup can throw is worth losing the announcement over, and an
+            // exception escaping here would reach the connect/disconnect handler.
+            Logger.LogWarning(ex, "Unexpected GeoIP failure for {Ip}", ipText);
+            return GeoLocation.Unknown;
+        }
     }
 
     private void LoadAllFiles()
     {
         lock (_fileLock)
         {
+            // Each loader validates before it publishes, so a failure never leaves a
+            // half-parsed file live. The sequence as a whole is not atomic though: an
+            // earlier step may already have applied while a later one failed, so the log
+            // says the state is mixed rather than claiming nothing changed. Staying loaded
+            // beats going silent — a reload of a bad file should not be worse than not
+            // reloading at all.
+            var wasLoaded = _filesLoaded;
+
             try
             {
                 LoadConfig();
@@ -315,8 +575,10 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
             }
             catch (Exception ex)
             {
-                _filesLoaded = false;
-                Logger.LogError(ex, "Connect Announce could not load its files.");
+                _filesLoaded = wasLoaded;
+                Logger.LogError(ex, wasLoaded
+                    ? "Connect Announce could not finish reloading. Announcements stay on, but some settings may still be the previous ones. Fix the error above and run css_ca_reload again."
+                    : "Connect Announce could not load its files.");
             }
         }
     }
@@ -331,23 +593,52 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
             }
 
             _geoLoadAttempted = true;
-            var mmdb = Path.IsPathRooted(_config.GeoLiteDatabasePath)
-                ? _config.GeoLiteDatabasePath
-                : Path.Combine(ModuleDirectory, _config.GeoLiteDatabasePath);
+
+            // A missing or blank path is a configuration mistake, not a reason to throw out
+            // of here: an exception would escape into LoadAllFiles and abort the rest of the
+            // reload, leaving the plugin running with no geo data and no clear explanation.
+            var configuredPath = _config.GeoLiteDatabasePath;
+            if (string.IsNullOrWhiteSpace(configuredPath))
+            {
+                Logger.LogWarning("GeoLiteDatabasePath is empty. GeoIP placeholders will use unknown values.");
+                return;
+            }
+
+            var mmdb = Path.IsPathRooted(configuredPath)
+                ? configuredPath
+                : Path.Combine(ModuleDirectory, configuredPath);
             if (!File.Exists(mmdb))
             {
                 Logger.LogWarning("GeoLite2 database was not found at {Path}. GeoIP placeholders will use unknown values.", mmdb);
                 return;
             }
 
+            DatabaseReader? reader = null;
             try
             {
-                _geoReader = new DatabaseReader(mmdb, FileAccessMode.Memory);
+                reader = new DatabaseReader(mmdb, FileAccessMode.Memory);
+
+                // A Country or ASN database opens happily but throws on every City lookup,
+                // which would break every announcement while the log still said the
+                // database had loaded. Reject it here instead, with the reason. Enterprise
+                // databases do support city lookups, so they are accepted too.
+                var databaseType = reader.Metadata.DatabaseType;
+                if (!databaseType.Contains("City", StringComparison.OrdinalIgnoreCase) &&
+                    !databaseType.Contains("Enterprise", StringComparison.OrdinalIgnoreCase))
+                {
+                    Logger.LogError("{Path} is a '{Type}' database, which cannot answer city lookups. A GeoLite2-City database is required; GeoIP placeholders will use unknown values.", mmdb, databaseType);
+                    reader.Dispose();
+                    return;
+                }
+
+                _geoReader = reader;
                 Logger.LogInformation("Loaded GeoLite2 database from {Path}", mmdb);
             }
             catch (Exception ex)
             {
-                _geoReader?.Dispose();
+                // Dispose the local: if the failure came from inspecting the metadata, the
+                // reader was opened but never stored, so _geoReader would not reach it.
+                reader?.Dispose();
                 _geoReader = null;
                 Logger.LogError(ex, "GeoLite2 database could not be loaded from {Path}. GeoIP placeholders will use unknown values.", mmdb);
             }
@@ -368,15 +659,30 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
     {
         if (!File.Exists(_configPath))
         {
-            _config = new ConnectAnnounceConfig();
-            ValidateConfigColors();
-            WriteConfig();
+            var defaults = new ConnectAnnounceConfig();
+            ValidateConfig(defaults);
+            _config = defaults;
+
+            // Writing the file is a convenience, not a prerequisite. A read-only configs
+            // directory should not stop the plugin from running on its defaults.
+            try
+            {
+                WriteConfig();
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning(ex, "Could not write {Path}. Running on default settings.", _configPath);
+            }
+
             return;
         }
 
+        // Validate before publishing: a reload of a bad file must leave the settings the
+        // server is currently running on untouched.
         var json = File.ReadAllText(_configPath);
-        _config = JsonSerializer.Deserialize<ConnectAnnounceConfig>(json, JsonOptions) ?? new ConnectAnnounceConfig();
-        ValidateConfigColors();
+        var candidate = JsonSerializer.Deserialize<ConnectAnnounceConfig>(json, JsonOptions) ?? new ConnectAnnounceConfig();
+        ValidateConfig(candidate);
+        _config = candidate;
 
         // The config is never rewritten on load. Missing keys fall back to their
         // defaults in memory, so the plugin works fine without touching the file.
@@ -406,17 +712,17 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
         return Path.Combine(rootDirectory, "configs");
     }
 
-    private void ValidateConfigColors()
+    private void ValidateConfig(ConnectAnnounceConfig config)
     {
         var configuredColors = new Dictionary<string, string>(StringComparer.Ordinal)
         {
-            [nameof(_config.PlayerNameColor)] = _config.PlayerNameColor,
-            [nameof(_config.SteamIdColor)] = _config.SteamIdColor,
-            [nameof(_config.LocationColor)] = _config.LocationColor,
-            [nameof(_config.PlayerIpColor)] = _config.PlayerIpColor,
-            [nameof(_config.PlayerTypeColor)] = _config.PlayerTypeColor,
-            [nameof(_config.DisconnectReasonLabelColor)] = _config.DisconnectReasonLabelColor,
-            [nameof(_config.DisconnectReasonColor)] = _config.DisconnectReasonColor
+            [nameof(config.PlayerNameColor)] = config.PlayerNameColor,
+            [nameof(config.SteamIdColor)] = config.SteamIdColor,
+            [nameof(config.LocationColor)] = config.LocationColor,
+            [nameof(config.PlayerIpColor)] = config.PlayerIpColor,
+            [nameof(config.PlayerTypeColor)] = config.PlayerTypeColor,
+            [nameof(config.DisconnectReasonLabelColor)] = config.DisconnectReasonLabelColor,
+            [nameof(config.DisconnectReasonColor)] = config.DisconnectReasonColor
         };
 
         foreach (var (name, color) in configuredColors)
@@ -426,6 +732,14 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
                 throw new InvalidOperationException($"{name} has invalid CSSSharp chat color '{color}'. Valid colors: {string.Join(", ", ChatColorTagExtensions.AvailableColorNames)}");
             }
         }
+
+        // A malformed flag is not worth refusing to load over, but silently matching
+        // nobody is the exact symptom that is impossible to diagnose from in-game.
+        var adminFlag = config.AdminFlag?.Trim();
+        if (!string.IsNullOrWhiteSpace(adminFlag) && !adminFlag.StartsWith('@'))
+        {
+            Logger.LogWarning("AdminFlag '{Flag}' does not start with '@', so it will not match any admin. Did you mean '{Suggestion}'?", adminFlag, "@" + adminFlag.TrimStart('#'));
+        }
     }
 
     private void LoadCountryMessages()
@@ -433,7 +747,16 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
         if (!File.Exists(_settingsPath))
         {
             _countryShow = DefaultCountryShow();
-            File.WriteAllText(_settingsPath, KeyValuesSerializer.Serialize(_countryShow));
+
+            try
+            {
+                File.WriteAllText(_settingsPath, KeyValuesSerializer.Serialize(_countryShow));
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning(ex, "Could not write {Path}. Running on default messages.", _settingsPath);
+            }
+
             return;
         }
 
@@ -556,19 +879,23 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
         return matches;
     }
 
-    private IEnumerable<CCSPlayerController> GetRealPlayers()
+    // Static so a deferred callback does not capture the plugin instance and keep an
+    // unloaded plugin alive across a hot reload.
+    private static IEnumerable<CCSPlayerController> GetRealPlayers()
     {
         return Utilities.GetPlayers().Where(IsRealPlayer)!;
     }
 
+    // HLTV/SourceTV slots are excluded: they are relay clients, not people to announce
+    // to, so they should never receive or generate an announcement.
     private static bool IsRealPlayer(CCSPlayerController? player)
     {
-        return player is { IsValid: true, IsBot: false, UserId: not null };
+        return player is { IsValid: true, IsBot: false, IsHLTV: false, UserId: not null };
     }
 
     private static bool IsConnectingPlayer(CCSPlayerController? player)
     {
-        return player is { IsValid: true, IsBot: false };
+        return player is { IsValid: true, IsBot: false, IsHLTV: false };
     }
 
     private static string? GetSteamKey(CCSPlayerController player)
@@ -625,6 +952,14 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
 
     private static bool IsLanIp(IPAddress address)
     {
+        // ::ffff:192.168.1.10 is a private IPv4 address wearing an IPv6 shape; without
+        // this it would take the IPv6 branch, match none of the local checks, and be
+        // treated as a public address.
+        if (address.IsIPv4MappedToIPv6)
+        {
+            address = address.MapToIPv4();
+        }
+
         if (IPAddress.IsLoopback(address))
         {
             return true;
@@ -665,11 +1000,23 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
         }
     }
 
-    private static string AddThePrefix(string country)
+    // Countries whose English name reads as "the <name>". Keyed on the ISO code because
+    // country names change and substring matching got it wrong: "Island" also matched
+    // Christmas Island and Norfolk Island, which do not take an article.
+    private static readonly HashSet<string> ArticleCountryCodes = new(StringComparer.OrdinalIgnoreCase)
     {
-        var prefixes = new[] { "United", "Republic", "Federation", "Island", "Netherlands", "Isle", "Bahamas", "Maldives", "Philippines", "Vatican" };
-        return prefixes.Any(country.Contains)
-            ? $"The {country}"
+        // States and territories
+        "AE", "BS", "CD", "CF", "DO", "GB", "GM", "IM", "KM",
+        "MV", "NL", "PH", "SC", "SD", "US",
+        // Island groups, which take the article in the plural
+        "BQ", "CC", "CK", "FK", "FO", "KY", "MH", "SB", "TC", "UM", "VG", "VI"
+    };
+
+    private static string AddThePrefix(string country, string countryCode2)
+    {
+        // Lowercase: the placeholder is used mid-sentence ("connected from the ...").
+        return ArticleCountryCodes.Contains(countryCode2)
+            ? $"the {country}"
             : country;
     }
 
@@ -741,15 +1088,30 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
         };
     }
 
-    private static bool IsMapTransitionDisconnectReason(int reasonCode)
+    // Disconnects that are not real departures: the client is coming straight back.
+    // Besides map/server transitions this covers the engine loop reconnects that
+    // MultiAddonManager (and any forced workshop download) triggers, where a client
+    // is dropped and reconnects once per addon. Announcing those spams the chat.
+    //   1  NETWORK_DISCONNECT_SHUTDOWN
+    //   53 NETWORK_DISCONNECT_RECONNECTION
+    //   54 NETWORK_DISCONNECT_LOOPSHUTDOWN
+    //   55 NETWORK_DISCONNECT_LOOPDEACTIVATE
+    //   56 NETWORK_DISCONNECT_HOST_ENDGAME
+    //   57 NETWORK_DISCONNECT_LOOP_LEVELLOAD_ACTIVATE
+    //   69 NETWORK_DISCONNECT_SERVER_SHUTDOWN
+    private static bool IsTransientDisconnectReason(int reasonCode)
     {
-        return reasonCode is 1 or 56 or 69;
+        return reasonCode is 1 or 53 or 54 or 55 or 56 or 57 or 69;
     }
 
-    private static JsonSerializerOptions JsonOptions => new()
+    // Lenient on read: this is a file the README tells admins to hand-edit, and a stray
+    // trailing comma should not take the plugin down.
+    private static readonly JsonSerializerOptions JsonOptions = new()
     {
         WriteIndented = true,
-        PropertyNameCaseInsensitive = true
+        PropertyNameCaseInsensitive = true,
+        AllowTrailingCommas = true,
+        ReadCommentHandling = JsonCommentHandling.Skip
     };
 }
 
@@ -822,8 +1184,18 @@ internal static class KeyValuesParser
         return root;
     }
 
-    private static void ParseChildren(KeyValuesNode parent, IReadOnlyList<string> tokens, ref int index)
+    // A malformed file must not be able to take the server down. Without a depth limit,
+    // deeply nested braces recurse until the stack overflows, and a StackOverflowException
+    // cannot be caught: the whole game server process dies with nothing in the log.
+    private const int MaxDepth = 32;
+
+    private static void ParseChildren(KeyValuesNode parent, IReadOnlyList<string> tokens, ref int index, int depth = 0)
     {
+        if (depth > MaxDepth)
+        {
+            throw new InvalidDataException($"KeyValues nesting is deeper than {MaxDepth} levels.");
+        }
+
         while (index < tokens.Count)
         {
             var key = tokens[index++];
@@ -841,7 +1213,7 @@ internal static class KeyValuesParser
             if (tokens[index] == "{")
             {
                 index++;
-                ParseChildren(parent.GetOrAddChild(key), tokens, ref index);
+                ParseChildren(parent.GetOrAddChild(key), tokens, ref index, depth + 1);
             }
             else
             {

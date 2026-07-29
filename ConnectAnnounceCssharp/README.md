@@ -1,53 +1,15 @@
 # Connect Announce
 
-Simple CounterStrikeSharp plugin that replaces connect/disconnect messages and resolves city/country data with `GeoLite2-City.mmdb`.
+Plugin source. All user-facing documentation — installation, configuration, placeholders, colors and commands — lives in the [repository README](../README.md), so there is only one copy to keep current.
 
-## Installation
+## Building
 
-Copy the complete `ConnectAnnounce` folder to:
-
-```text
-csgo/addons/counterstrikesharp/plugins/ConnectAnnounce/
+```bash
+dotnet build -c Release
 ```
 
-Do not upload only `ConnectAnnounce.dll`. `ConnectAnnounce.deps.json` must stay next to the DLL or CounterStrikeSharp cannot resolve the plugin dependencies.
+Output lands in `bin/Release/net10.0/`. A release is that folder's contents, minus the `.pdb`, laid out as a single `ConnectAnnounce/` folder with `data/cannounce_settings.txt` and `GeoLite2-City.mmdb` alongside the DLL.
 
-The release zip includes `GeoLite2-City.mmdb`, so it can be installed directly. To update the database later, download it from one of these links and replace the file in the plugin folder:
+`CounterStrikeSharp.API` is referenced with `ExcludeAssets="runtime"` because the CounterStrikeSharp runtime already provides it; shipping a second copy risks a load conflict. The MaxMind assemblies are not provided by the runtime and must be shipped.
 
-- https://git.io/GeoLite2-City.mmdb
-- https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-City.mmdb
-
-## Files
-
-- `ConnectAnnounce.dll`
-- `ConnectAnnounce.deps.json`
-- `GeoLite2-City.mmdb`
-- `MaxMind.GeoIP2` dependencies
-- `data/cannounce_settings.txt`
-
-The options JSON is generated on load at:
-
-```text
-csgo/addons/counterstrikesharp/configs/plugins/ConnectAnnounce/ConnectAnnounceConfig.json
-```
-
-Configurable colors in that JSON:
-
-```json
-{
-  "PlayerNameColor": "Purple",
-  "SteamIdColor": "Default",
-  "LocationColor": "Green",
-  "PlayerIpColor": "Default",
-  "PlayerTypeColor": "Default",
-  "DisconnectReasonLabelColor": "Green",
-  "DisconnectReasonColor": "Green"
-}
-```
-
-Valid CSSSharp color names: `Default`, `White`, `DarkRed`, `Green`, `LightYellow`, `LightBlue`, `Olive`, `Lime`, `Red`, `LightPurple`, `Purple`, `Grey`, `Yellow`, `Gold`, `Silver`, `Blue`, `DarkBlue`, `BlueGrey`, `Magenta`, `LightRed`, `Orange`.
-
-## Commands
-
-- `css_geolist <target>`
-- `css_ca_reload`
+When zipping a release, make sure the archive stores entry names with forward slashes. Windows PowerShell's `Compress-Archive` writes backslashes, which Linux `unzip` treats as part of the filename instead of as directories.
