@@ -23,7 +23,7 @@ namespace ConnectAnnounceCssharp;
 [MinimumApiVersion(371)]
 public sealed class ConnectAnnouncePlugin : BasePlugin
 {
-    private const string Version = "1.0.4";
+    private const string Version = "1.0.5";
     private const ulong SteamId64Base = 76561197960265728UL;
     private static readonly Regex PlaceholderPattern = new(@"\{[A-Za-z0-9_]+\}", RegexOptions.Compiled);
 
@@ -97,6 +97,55 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
 
         AddAdminOnlyCommand("css_geolist", "prints geographical information about target(s)", OnGeoListCommand, "@css/generic");
         AddCommand("css_ca_reload", "reloads Connect Announce files", OnReloadCommand);
+
+        // Only on a hot reload. On a cold start the server has no players yet, and asking for
+        // the player list before the first map is loaded would be the process's first read of
+        // Server.MaxPlayers — a value CounterStrikeSharp caches statically and never
+        // refreshes, so a pre-map answer would stick for every plugin for the whole session.
+        if (hotReload)
+        {
+            SeedPlayersAlreadyHere();
+        }
+    }
+
+    // A departure is only announced for a player we know arrived, so anyone already on the
+    // server when the plugin loads has to be recorded here or their eventual departure would
+    // be silent.
+    private void SeedPlayersAlreadyHere()
+    {
+        List<CCSPlayerController> players;
+        try
+        {
+            players = GetRealPlayers().ToList();
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Could not list the players already on the server.");
+            return;
+        }
+
+        var now = DateTime.UtcNow;
+        foreach (var player in players)
+        {
+            try
+            {
+                var steam64 = ResolveSteamId(player);
+                if (!steam64.HasValue)
+                {
+                    continue;
+                }
+
+                _lastSeenAt[steam64.Value] = now;
+                if (player.UserId is { } userId)
+                {
+                    _slotSteamIds[player.Slot] = (userId, steam64.Value);
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning(ex, "Could not record a player already on the server.");
+            }
+        }
     }
 
     public override void Unload(bool hotReload)
@@ -114,10 +163,11 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
         _mapChanging = false;
         _mapStartedAt = DateTime.UtcNow;
 
-        // Drop entries that have aged out. Players who stayed are normally stamped in
-        // OnMapEnd and by their transition disconnect, so this should only reach players
-        // who are gone. If both of those miss someone who is still here, the cost is one
-        // extra arrival announcement for them; nothing breaks.
+        // Drop entries that have aged out. Players who stayed are stamped in OnMapEnd and
+        // again by their transition disconnect, and re-authorizing on the new map stamps
+        // them a third time, so this should only reach players who are gone. If all of those
+        // miss someone who is still here, they are announced arriving once more and their
+        // eventual departure goes unannounced, because a departure needs a recorded arrival.
         var cutoff = DateTime.UtcNow - AnnounceWindow;
         foreach (var steam64 in _lastSeenAt.Where(entry => entry.Value < cutoff).Select(entry => entry.Key).ToList())
         {
@@ -242,19 +292,31 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
             return;
         }
 
-        // Refresh the timestamp on every authorization, including suppressed ones, so a
-        // long chain of reconnects keeps sliding the window instead of ageing out midway
-        // and announcing the same arrival twice.
+        // Record the player FIRST. Their departure is only announced if this entry exists, so
+        // nothing that can fail — every controller property is a native read — may run ahead
+        // of it and cost them their leaving message.
+        // The timestamp is refreshed on every authorization, including suppressed ones, so a
+        // long chain of reconnects keeps sliding the window instead of ageing out midway and
+        // announcing the same arrival twice.
         var steam64 = steamId.SteamId64;
-        if (player!.UserId is { } userId)
-        {
-            _slotSteamIds[playerSlot] = (userId, steam64);
-        }
-
         var now = DateTime.UtcNow;
         var alreadyAnnounced = _lastSeenAt.TryGetValue(steam64, out var lastAnnounced) &&
                                now - lastAnnounced < AnnounceWindow;
         _lastSeenAt[steam64] = now;
+
+        // Best-effort: only used as a fallback when AuthorizedSteamID stops resolving later.
+        try
+        {
+            if (player!.UserId is { } userId)
+            {
+                _slotSteamIds[playerSlot] = (userId, steam64);
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Could not cache the SteamID for slot {Slot}.", playerSlot);
+        }
+
         if (alreadyAnnounced)
         {
             return;
@@ -323,21 +385,22 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
             return;
         }
 
-        // A resolvable SteamID is what separates a real departure from a client that was
-        // rejected before it ever authorized (banned, VAC, server full). Those have no
-        // SteamID and would otherwise produce a "disconnected" line with a blank one and
-        // no matching arrival. Deliberately not also requiring a _lastSeenAt entry: after
-        // a plugin reload the table is empty, and everyone already on the server would
-        // then leave silently.
         if (!steam64.HasValue)
         {
             return;
         }
 
-        _lastSeenAt.Remove(steam64.Value);
+        // Only announce a departure for someone whose arrival we know about. A client that
+        // is authorized and then immediately rejected — a reserved-slot plugin turning away
+        // a non-VIP from a full server, a ban check, a whitelist — was never announced
+        // arriving, and announcing it produces a stream of "disconnected" lines for players
+        // who were never really here. An entry exists for anyone announced arriving, present
+        // at a map change, or already connected when the plugin loaded, so a genuine
+        // departure is never lost.
+        var hadArrived = _lastSeenAt.Remove(steam64.Value);
         _slotSteamIds.Remove(player!.Slot);
 
-        if (_config.ShowEnhancedDisconnectMessage)
+        if (hadArrived && _config.ShowEnhancedDisconnectMessage)
         {
             // Resolve both from our own copy of the SteamID: reading it off a controller
             // that is going away can come back empty, which would render the message with
@@ -394,6 +457,14 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
         }
 
         LoadAllFiles();
+
+        if (_filesLoaded)
+        {
+            // Players who connected while the files were not loaded were never recorded, so
+            // pick them up now rather than letting their departure go unannounced.
+            SeedPlayersAlreadyHere();
+        }
+
         command.ReplyToCommand(_filesLoaded
             ? "[CA] Reloaded Connect Announce configuration."
             : "[CA] Reload failed. Check the server log for the exact error.");
@@ -401,16 +472,29 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
 
     private void PrintEnhancedMessage(CCSPlayerController subject, bool subjectIsAdmin, string playerMessage, string adminMessage, string? steamKey = null, string? disconnectReason = null)
     {
-        // When the connecting/disconnecting player is an admin, the whole server
-        // sees the admin message so everyone knows an admin joined or left.
-        var useAdminMessage = _config.ShowEnhancedToAdmins && subjectIsAdmin;
+        // Two ways to use the admin template, chosen by AdminMessageMode:
+        //   Subject   - the whole server sees the admin template when the player who
+        //               connected or left is an admin, so everyone knows an admin is on.
+        //   Recipient - admins see the admin template and everyone else sees the normal
+        //               one, for every announcement, so admins get the extra detail.
+        // ShowEnhancedToAdmins is the master switch for both.
+        var enhancedForAdmins = _config.ShowEnhancedToAdmins;
+        var perRecipient = enhancedForAdmins && UseRecipientAdminMessages;
 
-        // Format now, while the subject is still around to read from.
-        var formatted = FormatMessage(useAdminMessage ? adminMessage : playerMessage, subject, subjectIsAdmin, steamKey, disconnectReason);
+        // Format up front, while the subject is still readable. Recipient mode needs both
+        // variants, but each is still built exactly once here — never once per recipient,
+        // which would repeat the GeoIP lookup for every player on the server.
+        var publicLine = FormatMessage(
+            !perRecipient && enhancedForAdmins && subjectIsAdmin ? adminMessage : playerMessage,
+            subject, subjectIsAdmin, steamKey, disconnectReason);
+        var adminLine = perRecipient
+            ? FormatMessage(adminMessage, subject, subjectIsAdmin, steamKey, disconnectReason)
+            : null;
 
-        // Capture the logger rather than reaching for the property from inside the
+        // Capture the logger and the flag rather than reaching for members from inside the
         // callback, so the closure does not hold on to the plugin instance.
         var logger = Logger;
+        var adminFlag = ResolvedAdminFlag;
 
         // Defer the broadcast so it never runs while a connect or disconnect is still being
         // processed, and resolve the recipients inside the callback so the list reflects who
@@ -447,7 +531,13 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
                         continue;
                     }
 
-                    player.PrintToChat(" " + formatted);
+                    // adminLine is only non-null in recipient mode, so subject mode does
+                    // not pay for an admin lookup per player.
+                    var line = adminLine is not null && IsAdminRecipient(player, adminFlag)
+                        ? adminLine
+                        : publicLine;
+
+                    player.PrintToChat(" " + line);
                 }
                 catch (Exception ex)
                 {
@@ -472,15 +562,21 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
         var steamKey = steamKeyOverride ?? GetSteamKey(player) ?? "";
         var playerType = isAdmin ? "Admin" : "Player";
 
+        // Country, city and region can each be given their own colour; whichever are left
+        // empty fall back to LocationColor, which is what every existing config uses.
+        var countryColor = Or(_config.CountryColor, _config.LocationColor);
+        var cityColor = Or(_config.CityColor, _config.LocationColor);
+        var regionColor = Or(_config.RegionColor, _config.LocationColor);
+
         var replacements = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
             ["{PLAYERNAME}"] = ChatColorTagExtensions.Colorize(_config.PlayerNameColor, player.PlayerName),
             ["{STEAMID}"] = ChatColorTagExtensions.Colorize(_config.SteamIdColor, steamKey),
-            ["{PLAYERCOUNTRY}"] = ChatColorTagExtensions.Colorize(_config.LocationColor, AddThePrefix(location.Country, location.CountryCode2)),
-            ["{PLAYERCOUNTRYSHORT}"] = ChatColorTagExtensions.Colorize(_config.LocationColor, location.CountryCode2),
-            ["{PLAYERCOUNTRYSHORT3}"] = ChatColorTagExtensions.Colorize(_config.LocationColor, location.CountryCode3),
-            ["{PLAYERCITY}"] = ChatColorTagExtensions.Colorize(_config.LocationColor, location.City),
-            ["{PLAYERREGION}"] = ChatColorTagExtensions.Colorize(_config.LocationColor, location.Region),
+            ["{PLAYERCOUNTRY}"] = ChatColorTagExtensions.Colorize(countryColor, AddThePrefix(location.Country, location.CountryCode2)),
+            ["{PLAYERCOUNTRYSHORT}"] = ChatColorTagExtensions.Colorize(countryColor, location.CountryCode2),
+            ["{PLAYERCOUNTRYSHORT3}"] = ChatColorTagExtensions.Colorize(countryColor, location.CountryCode3),
+            ["{PLAYERCITY}"] = ChatColorTagExtensions.Colorize(cityColor, location.City),
+            ["{PLAYERREGION}"] = ChatColorTagExtensions.Colorize(regionColor, location.Region),
             ["{PLAYERIP}"] = ChatColorTagExtensions.Colorize(_config.PlayerIpColor, ip),
             ["{PLAYERTYPE}"] = ChatColorTagExtensions.Colorize(_config.PlayerTypeColor, playerType),
             ["{DISC_REASON_LABEL}"] = ChatColorTagExtensions.Colorize(_config.DisconnectReasonLabelColor, "reason: "),
@@ -725,6 +821,22 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
             [nameof(config.DisconnectReasonColor)] = config.DisconnectReasonColor
         };
 
+        // Optional: empty means "inherit LocationColor", so only a non-empty value is checked.
+        var optionalColors = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            [nameof(config.CountryColor)] = config.CountryColor,
+            [nameof(config.CityColor)] = config.CityColor,
+            [nameof(config.RegionColor)] = config.RegionColor
+        };
+
+        foreach (var (name, color) in optionalColors)
+        {
+            if (!string.IsNullOrWhiteSpace(color))
+            {
+                configuredColors[name] = color.Trim();
+            }
+        }
+
         foreach (var (name, color) in configuredColors)
         {
             if (!ChatColorTagExtensions.IsKnownColor(color))
@@ -739,6 +851,16 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
         if (!string.IsNullOrWhiteSpace(adminFlag) && !adminFlag.StartsWith('@'))
         {
             Logger.LogWarning("AdminFlag '{Flag}' does not start with '@', so it will not match any admin. Did you mean '{Suggestion}'?", adminFlag, "@" + adminFlag.TrimStart('#'));
+        }
+
+        // Same reasoning: an unrecognised mode falls back to the long-standing behaviour
+        // rather than refusing to load, but it must not do so silently.
+        var mode = config.AdminMessageMode?.Trim();
+        if (!string.IsNullOrEmpty(mode) &&
+            !mode.Equals(SubjectAdminMessageMode, StringComparison.OrdinalIgnoreCase) &&
+            !mode.Equals(RecipientAdminMessageMode, StringComparison.OrdinalIgnoreCase))
+        {
+            Logger.LogWarning("AdminMessageMode '{Mode}' is not recognised. Valid values are '{Subject}' and '{Recipient}'; falling back to '{Fallback}'.", mode, SubjectAdminMessageMode, RecipientAdminMessageMode, SubjectAdminMessageMode);
         }
     }
 
@@ -829,21 +951,66 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
                AdminManager.PlayerHasPermissions(player, permission);
     }
 
-    // Resolve admin status from the SteamID, not the controller. The controller
-    // overload of PlayerHasPermissions returns false unless the player is already
-    // in the Connected state, which is NOT guaranteed at OnClientAuthorized time,
-    // so a connecting admin would otherwise be announced as a normal player. The
-    // SteamID overload has no such guard and admin data is keyed by SteamID.
+    private const string SubjectAdminMessageMode = "Subject";
+    private const string RecipientAdminMessageMode = "Recipient";
+
+    // Only an explicit, recognised "Recipient" switches modes. Anything else — a typo, an
+    // empty string, a key missing from an older config — keeps the original behaviour.
+    private bool UseRecipientAdminMessages =>
+        RecipientAdminMessageMode.Equals(_config.AdminMessageMode?.Trim(), StringComparison.OrdinalIgnoreCase);
+
+    // An optional colour override, falling back when it is unset.
+    private static string Or(string? preferred, string fallback)
+    {
+        return string.IsNullOrWhiteSpace(preferred) ? fallback : preferred.Trim();
+    }
+
+    private string ResolvedAdminFlag
+    {
+        get
+        {
+            var flag = _config.AdminFlag?.Trim();
+            return string.IsNullOrEmpty(flag) ? "@css/generic" : flag;
+        }
+    }
+
     private bool IsAdmin(SteamID? steamId)
+    {
+        return HasAdminFlag(steamId, ResolvedAdminFlag);
+    }
+
+    // Resolve admin status from the SteamID, not the controller. The controller overload of
+    // PlayerHasPermissions returns false unless the player is already in the Connected
+    // state, which is NOT guaranteed at OnClientAuthorized time, so a connecting admin
+    // would otherwise be announced as a normal player. The SteamID overload has no such
+    // guard and admin data is keyed by SteamID.
+    // Static, and takes the flag as an argument, so the deferred broadcast can call it
+    // without its closure capturing the plugin instance.
+    private static bool HasAdminFlag(SteamID? steamId, string adminFlag)
     {
         if (steamId == null)
         {
             return false;
         }
 
-        var flag = string.IsNullOrWhiteSpace(_config.AdminFlag) ? "@css/generic" : _config.AdminFlag;
         return AdminManager.PlayerHasPermissions(steamId, "@css/root") ||
-               AdminManager.PlayerHasPermissions(steamId, flag);
+               AdminManager.PlayerHasPermissions(steamId, adminFlag);
+    }
+
+    // Admin status of a message RECIPIENT. Recipients come from GetRealPlayers, which only
+    // returns fully connected players, so reading their SteamID here is the easy case.
+    // Fails closed: if it cannot be determined, treat them as a regular player so the admin
+    // variant — which may carry a SteamID or IP — is never shown to someone unverified.
+    private static bool IsAdminRecipient(CCSPlayerController player, string adminFlag)
+    {
+        try
+        {
+            return HasAdminFlag(player.AuthorizedSteamID, adminFlag);
+        }
+        catch (Exception)
+        {
+            return false;
+        }
     }
 
     private IEnumerable<CCSPlayerController> FindTargets(CCSPlayerController? caller, string pattern)
@@ -1120,6 +1287,10 @@ public sealed record ConnectAnnounceConfig
     public bool ShowEnhancedConnectMessage { get; init; } = true;
     public bool ShowEnhancedDisconnectMessage { get; init; } = true;
     public bool ShowEnhancedToAdmins { get; init; } = true;
+
+    // "Subject" (default) or "Recipient". See the README; anything else is warned about and
+    // treated as "Subject", which is the behaviour every existing install already has.
+    public string AdminMessageMode { get; init; } = "Subject";
     public string AdminFlag { get; init; } = "@css/generic";
     public bool ShowStandardConnectMessage { get; init; }
     public bool ShowStandardDisconnectMessage { get; init; }
@@ -1127,6 +1298,12 @@ public sealed record ConnectAnnounceConfig
     public string PlayerNameColor { get; init; } = "Purple";
     public string SteamIdColor { get; init; } = "Default";
     public string LocationColor { get; init; } = "Green";
+
+    // Optional overrides. Empty means "use LocationColor", so an existing config that only
+    // sets LocationColor keeps colouring all five location placeholders the same way.
+    public string CountryColor { get; init; } = "";
+    public string CityColor { get; init; } = "";
+    public string RegionColor { get; init; } = "";
     public string PlayerIpColor { get; init; } = "Default";
     public string PlayerTypeColor { get; init; } = "Default";
     public string DisconnectReasonLabelColor { get; init; } = "Green";
