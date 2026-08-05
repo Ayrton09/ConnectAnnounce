@@ -23,7 +23,7 @@ namespace ConnectAnnounceCssharp;
 [MinimumApiVersion(371)]
 public sealed class ConnectAnnouncePlugin : BasePlugin
 {
-    private const string Version = "1.0.5";
+    private const string Version = "1.0.6";
     private const ulong SteamId64Base = 76561197960265728UL;
     private static readonly Regex PlaceholderPattern = new(@"\{[A-Za-z0-9_]+\}", RegexOptions.Compiled);
 
@@ -594,6 +594,25 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
         return LookupLocation(ExtractIp(player.IpAddress));
     }
 
+    // A private address carries no location — it is not in any GeoIP database — so the
+    // plugin substitutes fixed text. A server whose players are all on one network can
+    // replace that with the real place instead. Each part is optional and keeps its
+    // original wording when left empty.
+    private GeoLocation LanLocation()
+    {
+        var fallback = GeoLocation.Lan;
+        var countryCode = Or(_config.LanCountryCode, fallback.CountryCode2);
+
+        return new GeoLocation(
+            Or(_config.LanCity, fallback.City),
+            Or(_config.LanRegion, fallback.Region),
+            Or(_config.LanCountry, fallback.Country),
+            countryCode,
+            // Derive the three-letter form from the two-letter one, exactly as a real
+            // lookup does, rather than making the operator supply both.
+            countryCode == fallback.CountryCode2 ? fallback.CountryCode3 : ToIso3(countryCode));
+    }
+
     private GeoLocation LookupLocation(string ipText)
     {
         if (!IPAddress.TryParse(ipText, out var address))
@@ -603,7 +622,7 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
 
         if (IsLanIp(address))
         {
-            return GeoLocation.Lan;
+            return LanLocation();
         }
 
         // Read the field once so a reload cannot swap it midway through this method. This
@@ -845,6 +864,14 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
             }
         }
 
+        // Not worth refusing to load over: the three-letter placeholder just falls back to
+        // "???", which is hard to trace back to this key without a hint in the log.
+        var lanCountryCode = config.LanCountryCode?.Trim();
+        if (!string.IsNullOrEmpty(lanCountryCode) && ToIso3(lanCountryCode) == "???")
+        {
+            Logger.LogWarning("LanCountryCode '{Code}' is not a known two-letter country code, so {{PLAYERCOUNTRYSHORT3}} will show '???' for players on a local address.", lanCountryCode);
+        }
+
         // A malformed flag is not worth refusing to load over, but silently matching
         // nobody is the exact symptom that is impossible to diagnose from in-game.
         var adminFlag = config.AdminFlag?.Trim();
@@ -959,7 +986,7 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
     private bool UseRecipientAdminMessages =>
         RecipientAdminMessageMode.Equals(_config.AdminMessageMode?.Trim(), StringComparison.OrdinalIgnoreCase);
 
-    // An optional colour override, falling back when it is unset.
+    // An optional override, falling back when it is unset.
     private static string Or(string? preferred, string fallback)
     {
         return string.IsNullOrWhiteSpace(preferred) ? fallback : preferred.Trim();
@@ -1181,6 +1208,17 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
 
     private static string AddThePrefix(string country, string countryCode2)
     {
+        // Never stack articles. The stand-in wordings already carry one ("a Local Area
+        // Network", "an Unknown Country"), and the article is chosen from the country code,
+        // so a config that sets LanCountryCode without LanCountry would otherwise render
+        // "the a Local Area Network". No real country name begins with a bare article.
+        if (country.StartsWith("a ", StringComparison.OrdinalIgnoreCase) ||
+            country.StartsWith("an ", StringComparison.OrdinalIgnoreCase) ||
+            country.StartsWith("the ", StringComparison.OrdinalIgnoreCase))
+        {
+            return country;
+        }
+
         // Lowercase: the placeholder is used mid-sentence ("connected from the ...").
         return ArticleCountryCodes.Contains(countryCode2)
             ? $"the {country}"
@@ -1304,6 +1342,13 @@ public sealed record ConnectAnnounceConfig
     public string CountryColor { get; init; } = "";
     public string CityColor { get; init; } = "";
     public string RegionColor { get; init; } = "";
+
+    // What to report for players on a private address, which has no location of its own.
+    // Empty keeps the generic wording the plugin has always used.
+    public string LanCountry { get; init; } = "";
+    public string LanRegion { get; init; } = "";
+    public string LanCity { get; init; } = "";
+    public string LanCountryCode { get; init; } = "";
     public string PlayerIpColor { get; init; } = "Default";
     public string PlayerTypeColor { get; init; } = "Default";
     public string DisconnectReasonLabelColor { get; init; } = "Green";

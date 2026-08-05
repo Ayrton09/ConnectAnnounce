@@ -81,6 +81,10 @@ Available placeholders:
   "CountryColor": "",
   "CityColor": "",
   "RegionColor": "",
+  "LanCountry": "",
+  "LanRegion": "",
+  "LanCity": "",
+  "LanCountryCode": "",
   "PlayerIpColor": "Default",
   "PlayerTypeColor": "Default",
   "DisconnectReasonLabelColor": "Green",
@@ -98,6 +102,23 @@ Available placeholders:
 | `ShowStandardConnectMessage` | Keep the game's own connect message as well. |
 | `ShowStandardDisconnectMessage` | Keep the game's own disconnect message as well. |
 | `GeoLiteDatabasePath` | Path to the mmdb, relative to the plugin folder or absolute. |
+
+### Players on a local network
+
+A private address — `192.168.x`, `10.x`, `172.16–31.x`, loopback, and their IPv6 equivalents — is in no GeoIP database, so those players are announced with generic wording: *connected from a Local Area Network | an IP Address*. If everyone reaching your server over the local network is in fact in one place, you can say where:
+
+```json
+{
+  "LanCountry": "Russia",
+  "LanRegion": "Moscow Oblast",
+  "LanCity": "Moscow",
+  "LanCountryCode": "RU"
+}
+```
+
+`{PLAYERCOUNTRYSHORT3}` is derived from `LanCountryCode`, so `"RU"` gives `RU` and `RUS`. A code that is not a recognised two-letter country shows `???` there and is reported in the server log. Each key is optional and keeps its original wording when left empty.
+
+This applies to every player on a private address, not to one person — a private address says nothing about who is behind it.
 
 ### Rejected connections
 
