@@ -23,7 +23,7 @@ namespace ConnectAnnounceCssharp;
 [MinimumApiVersion(375)]
 public sealed class ConnectAnnouncePlugin : BasePlugin
 {
-    private const string Version = "1.0.6";
+    private const string Version = "1.0.7";
     private const ulong SteamId64Base = 76561197960265728UL;
     private static readonly Regex PlaceholderPattern = new(@"\{[A-Za-z0-9_]+\}", RegexOptions.Compiled);
 
