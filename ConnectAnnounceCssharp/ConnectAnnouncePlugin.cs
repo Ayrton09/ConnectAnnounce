@@ -20,7 +20,7 @@ namespace ConnectAnnounceCssharp;
 // Matches the requirement stated in the README. CounterStrikeSharp compares this against
 // its own build number, so an older server refuses the plugin with a clear message instead
 // of loading it and failing later on an API that does not exist there.
-[MinimumApiVersion(371)]
+[MinimumApiVersion(375)]
 public sealed class ConnectAnnouncePlugin : BasePlugin
 {
     private const string Version = "1.0.6";
@@ -322,13 +322,12 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
             return;
         }
 
-        var steamKey = GetSteamKey(steamId);
         if (_config.ShowEnhancedConnectMessage)
         {
             var subjectIsAdmin = IsAdmin(steamId);
             var playerMsg = GetCountryMessage("messages", "playerjoin");
             var adminMsg = GetCountryMessage("messages_admin", "playerjoin");
-            PrintEnhancedMessage(player!, subjectIsAdmin, playerMsg, adminMsg, steamKey);
+            PrintEnhancedMessage(player!, subjectIsAdmin, playerMsg, adminMsg, steam64);
         }
     }
 
@@ -406,11 +405,10 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
             // that is going away can come back empty, which would render the message with
             // a blank {STEAMID} and announce an admin as an ordinary player.
             var subjectIsAdmin = IsAdmin(new SteamID(steam64.Value));
-            var steamKey = ToSteam2(steam64.Value, universe: 1);
             var reason = GetDisconnectReason(@event.Reason);
             var playerMsg = GetCountryMessage("messages", "playerdisc");
             var adminMsg = GetCountryMessage("messages_admin", "playerdisc");
-            PrintEnhancedMessage(player!, subjectIsAdmin, playerMsg, adminMsg, steamKey, reason);
+            PrintEnhancedMessage(player!, subjectIsAdmin, playerMsg, adminMsg, steam64.Value, reason);
         }
     }
 
@@ -470,7 +468,7 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
             : "[CA] Reload failed. Check the server log for the exact error.");
     }
 
-    private void PrintEnhancedMessage(CCSPlayerController subject, bool subjectIsAdmin, string playerMessage, string adminMessage, string? steamKey = null, string? disconnectReason = null)
+    private void PrintEnhancedMessage(CCSPlayerController subject, bool subjectIsAdmin, string playerMessage, string adminMessage, ulong? steam64 = null, string? disconnectReason = null)
     {
         // Two ways to use the admin template, chosen by AdminMessageMode:
         //   Subject   - the whole server sees the admin template when the player who
@@ -486,9 +484,9 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
         // which would repeat the GeoIP lookup for every player on the server.
         var publicLine = FormatMessage(
             !perRecipient && enhancedForAdmins && subjectIsAdmin ? adminMessage : playerMessage,
-            subject, subjectIsAdmin, steamKey, disconnectReason);
+            subject, subjectIsAdmin, steam64, disconnectReason);
         var adminLine = perRecipient
-            ? FormatMessage(adminMessage, subject, subjectIsAdmin, steamKey, disconnectReason)
+            ? FormatMessage(adminMessage, subject, subjectIsAdmin, steam64, disconnectReason)
             : null;
 
         // Capture the logger and the flag rather than reaching for members from inside the
@@ -547,7 +545,7 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
         });
     }
 
-    private string FormatMessage(string rawMessage, CCSPlayerController? player, bool isAdmin, string? steamKeyOverride = null, string? disconnectReason = null)
+    private string FormatMessage(string rawMessage, CCSPlayerController? player, bool isAdmin, ulong? steam64Override = null, string? disconnectReason = null)
     {
         var message = ApplyColorTags(rawMessage);
         if (player == null)
@@ -559,7 +557,9 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
         // native round-trip, and this runs inside the connect/disconnect path.
         var ip = ExtractIp(player.IpAddress);
         var location = LookupLocation(ip);
-        var steamKey = steamKeyOverride ?? GetSteamKey(player) ?? "";
+        var steam64 = steam64Override ?? player.AuthorizedSteamID?.SteamId64;
+        var steamKey = steam64 == null ? "" : ToSteam2(steam64.Value, universe: 1);
+        var steamId64 = steam64?.ToString(CultureInfo.InvariantCulture) ?? "";
         var playerType = isAdmin ? "Admin" : "Player";
 
         // Country, city and region can each be given their own colour; whichever are left
@@ -572,6 +572,7 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
         {
             ["{PLAYERNAME}"] = ChatColorTagExtensions.Colorize(_config.PlayerNameColor, player.PlayerName),
             ["{STEAMID}"] = ChatColorTagExtensions.Colorize(_config.SteamIdColor, steamKey),
+            ["{STEAMID64}"] = ChatColorTagExtensions.Colorize(_config.SteamIdColor, steamId64),
             ["{PLAYERCOUNTRY}"] = ChatColorTagExtensions.Colorize(countryColor, AddThePrefix(location.Country, location.CountryCode2)),
             ["{PLAYERCOUNTRYSHORT}"] = ChatColorTagExtensions.Colorize(countryColor, location.CountryCode2),
             ["{PLAYERCOUNTRYSHORT3}"] = ChatColorTagExtensions.Colorize(countryColor, location.CountryCode3),
@@ -1096,11 +1097,6 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
     {
         var steam64 = player.AuthorizedSteamID?.SteamId64;
         return steam64 == null ? null : ToSteam2(steam64.Value, universe: 1);
-    }
-
-    private static string GetSteamKey(SteamID steamId)
-    {
-        return ToSteam2(steamId.SteamId64, universe: 1);
     }
 
     private static string ToSteam2(ulong steam64, int universe)

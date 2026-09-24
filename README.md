@@ -4,7 +4,7 @@ Simple CounterStrikeSharp plugin that replaces connect/disconnect messages and r
 
 ## Requirements
 
-- CounterStrikeSharp `1.0.371` or newer (.NET 10)
+- CounterStrikeSharp `1.0.375` or newer (.NET 10)
 
 ## Installation
 
@@ -50,7 +50,8 @@ ConnectAnnounce/data/cannounce_settings.txt
 Available placeholders:
 
 - `{PLAYERNAME}`
-- `{STEAMID}`
+- `{STEAMID}` (`STEAM_1:1:12345678`)
+- `{STEAMID64}` (`76561197984957085`), colored with `SteamIdColor` like `{STEAMID}`
 - `{PLAYERCOUNTRY}`
 - `{PLAYERCOUNTRYSHORT}`
 - `{PLAYERCOUNTRYSHORT3}`
