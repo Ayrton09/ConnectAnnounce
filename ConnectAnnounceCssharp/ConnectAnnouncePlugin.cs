@@ -23,7 +23,7 @@ namespace ConnectAnnounceCssharp;
 [MinimumApiVersion(375)]
 public sealed class ConnectAnnouncePlugin : BasePlugin
 {
-    private const string Version = "1.0.7";
+    private const string Version = "1.0.8";
     private const ulong SteamId64Base = 76561197960265728UL;
     private static readonly Regex PlaceholderPattern = new(@"\{[A-Za-z0-9_]+\}", RegexOptions.Compiled);
 
@@ -49,7 +49,11 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
     private ConnectAnnounceConfig _config = new();
     private KeyValuesNode _countryShow = new("CountryShow");
     private DatabaseReader? _geoReader;
-    private bool _geoLoadAttempted;
+    // Identity of the file behind _geoReader, so a reload can skip re-reading an unchanged
+    // database. Only touched under _geoLock.
+    private string _geoPath = "";
+    private long _geoSize;
+    private long _geoMtimeTicks;
     private bool _filesLoaded;
     private bool _mapChanging;
 
@@ -59,6 +63,7 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
     // arrivals and departures. Replaces a timer that used to clear _mapChanging late.
     private static readonly TimeSpan MapSettleWindow = TimeSpan.FromSeconds(15);
     private DateTime _mapStartedAt = DateTime.MinValue;
+    private volatile bool _unloaded;
     private string _dataDirectory = "";
     private string _settingsPath = "";
     private string _configPath = "";
@@ -98,13 +103,27 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
         AddAdminOnlyCommand("css_geolist", "prints geographical information about target(s)", OnGeoListCommand, "@css/generic");
         AddCommand("css_ca_reload", "reloads Connect Announce files", OnReloadCommand);
 
-        // Only on a hot reload. On a cold start the server has no players yet, and asking for
-        // the player list before the first map is loaded would be the process's first read of
-        // Server.MaxPlayers — a value CounterStrikeSharp caches statically and never
-        // refreshes, so a pre-map answer would stick for every plugin for the whole session.
+        // On a hot reload the world is already running, so seed right away. On a cold start
+        // the server has no players yet, and asking for the player list before the first map
+        // is loaded would be the process's first read of Server.MaxPlayers, a value
+        // CounterStrikeSharp caches statically and never refreshes, so a pre-map answer
+        // would stick for every plugin for the whole session. A load by command
+        // (css_plugins load) also reports hotReload false while the map is running, so queue
+        // the seed for the next world update: it only runs once a world exists and never
+        // touches entities before the first OnMapStart.
         if (hotReload)
         {
             SeedPlayersAlreadyHere();
+        }
+        else
+        {
+            Server.NextWorldUpdate(() =>
+            {
+                if (!_unloaded)
+                {
+                    SeedPlayersAlreadyHere();
+                }
+            });
         }
     }
 
@@ -125,10 +144,18 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
         }
 
         var now = DateTime.UtcNow;
+        var recorded = 0;
         foreach (var player in players)
         {
             try
             {
+                // Someone still joining is recorded by OnClientAuthorized. Recording them here
+                // first would make that announcement look like a repeat and silence it.
+                if (player.Connected != PlayerConnectedState.Connected)
+                {
+                    continue;
+                }
+
                 var steam64 = ResolveSteamId(player);
                 if (!steam64.HasValue)
                 {
@@ -140,16 +167,22 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
                 {
                     _slotSteamIds[player.Slot] = (userId, steam64.Value);
                 }
+
+                recorded++;
             }
             catch (Exception ex)
             {
                 Logger.LogWarning(ex, "Could not record a player already on the server.");
             }
         }
+
+        Logger.LogInformation("Registered {Count} player(s) already on the server.", recorded);
     }
 
     public override void Unload(bool hotReload)
     {
+        _unloaded = true;
+
         // Same lock as every other write to the reader; reads take a local snapshot.
         lock (_geoLock)
         {
@@ -685,7 +718,6 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
             {
                 LoadConfig();
                 LoadCountryMessages();
-                ResetGeoDatabase();
                 LoadGeoDatabase();
                 _filesLoaded = true;
             }
@@ -701,73 +733,103 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
 
     private void LoadGeoDatabase()
     {
-        lock (_geoLock)
+        // Open and validate the new database before touching the live one. A reload that
+        // fails (bad path, missing file, wrong type) keeps serving the previous database
+        // instead of dropping to unknown locations until the next successful reload.
+        // Callers hold _fileLock, so two loads never race each other here.
+        var configuredPath = _config.GeoLiteDatabasePath;
+        if (string.IsNullOrWhiteSpace(configuredPath))
         {
-            if (_geoReader != null || _geoLoadAttempted)
+            LogGeoKept("GeoLiteDatabasePath is empty.");
+            return;
+        }
+
+        var mmdb = Path.IsPathRooted(configuredPath)
+            ? configuredPath
+            : Path.Combine(ModuleDirectory, configuredPath);
+        var fullPath = mmdb;
+
+        FileInfo info;
+        try
+        {
+            fullPath = Path.GetFullPath(mmdb);
+            info = new FileInfo(fullPath);
+            if (!info.Exists)
             {
+                LogGeoKept($"GeoLite2 database was not found at {fullPath}.");
                 return;
-            }
-
-            _geoLoadAttempted = true;
-
-            // A missing or blank path is a configuration mistake, not a reason to throw out
-            // of here: an exception would escape into LoadAllFiles and abort the rest of the
-            // reload, leaving the plugin running with no geo data and no clear explanation.
-            var configuredPath = _config.GeoLiteDatabasePath;
-            if (string.IsNullOrWhiteSpace(configuredPath))
-            {
-                Logger.LogWarning("GeoLiteDatabasePath is empty. GeoIP placeholders will use unknown values.");
-                return;
-            }
-
-            var mmdb = Path.IsPathRooted(configuredPath)
-                ? configuredPath
-                : Path.Combine(ModuleDirectory, configuredPath);
-            if (!File.Exists(mmdb))
-            {
-                Logger.LogWarning("GeoLite2 database was not found at {Path}. GeoIP placeholders will use unknown values.", mmdb);
-                return;
-            }
-
-            DatabaseReader? reader = null;
-            try
-            {
-                reader = new DatabaseReader(mmdb, FileAccessMode.Memory);
-
-                // A Country or ASN database opens happily but throws on every City lookup,
-                // which would break every announcement while the log still said the
-                // database had loaded. Reject it here instead, with the reason. Enterprise
-                // databases do support city lookups, so they are accepted too.
-                var databaseType = reader.Metadata.DatabaseType;
-                if (!databaseType.Contains("City", StringComparison.OrdinalIgnoreCase) &&
-                    !databaseType.Contains("Enterprise", StringComparison.OrdinalIgnoreCase))
-                {
-                    Logger.LogError("{Path} is a '{Type}' database, which cannot answer city lookups. A GeoLite2-City database is required; GeoIP placeholders will use unknown values.", mmdb, databaseType);
-                    reader.Dispose();
-                    return;
-                }
-
-                _geoReader = reader;
-                Logger.LogInformation("Loaded GeoLite2 database from {Path}", mmdb);
-            }
-            catch (Exception ex)
-            {
-                // Dispose the local: if the failure came from inspecting the metadata, the
-                // reader was opened but never stored, so _geoReader would not reach it.
-                reader?.Dispose();
-                _geoReader = null;
-                Logger.LogError(ex, "GeoLite2 database could not be loaded from {Path}. GeoIP placeholders will use unknown values.", mmdb);
             }
         }
-    }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Could not inspect the GeoLite2 database at {Path}.", fullPath);
+            LogGeoKept("The database could not be inspected.");
+            return;
+        }
 
-    private void ResetGeoDatabase()
-    {
+        var size = info.Length;
+        var mtimeTicks = info.LastWriteTimeUtc.Ticks;
         lock (_geoLock)
         {
-            _geoReader?.Dispose();
-            _geoReader = null;
-            _geoLoadAttempted = false;
+            if (_geoReader != null && _geoPath == fullPath && _geoSize == size && _geoMtimeTicks == mtimeTicks)
+            {
+                Logger.LogInformation("GeoLite2 database at {Path} is unchanged, keeping it loaded.", fullPath);
+                return;
+            }
+        }
+
+        DatabaseReader? reader = null;
+        try
+        {
+            reader = new DatabaseReader(fullPath, FileAccessMode.Memory);
+
+            // A Country or ASN database opens happily but throws on every City lookup,
+            // which would break every announcement while the log still said the
+            // database had loaded. Reject it here instead, with the reason. Enterprise
+            // databases do support city lookups, so they are accepted too.
+            var databaseType = reader.Metadata.DatabaseType;
+            if (!databaseType.Contains("City", StringComparison.OrdinalIgnoreCase) &&
+                !databaseType.Contains("Enterprise", StringComparison.OrdinalIgnoreCase))
+            {
+                Logger.LogError("{Path} is a '{Type}' database, which cannot answer city lookups. A GeoLite2-City database is required.", fullPath, databaseType);
+                reader.Dispose();
+                LogGeoKept("The new database is not a City database.");
+                return;
+            }
+        }
+        catch (Exception ex)
+        {
+            reader?.Dispose();
+            Logger.LogError(ex, "GeoLite2 database could not be loaded from {Path}.", fullPath);
+            LogGeoKept("The new database could not be opened.");
+            return;
+        }
+
+        DatabaseReader? old;
+        lock (_geoLock)
+        {
+            old = _geoReader;
+            _geoReader = reader;
+            _geoPath = fullPath;
+            _geoSize = size;
+            _geoMtimeTicks = mtimeTicks;
+        }
+
+        // Disposed after the swap, outside the lock. A lookup that captured the old reader
+        // just before the swap surfaces as one caught exception and one unknown location.
+        old?.Dispose();
+        Logger.LogInformation("Loaded GeoLite2 database from {Path}", fullPath);
+    }
+
+    private void LogGeoKept(string reason)
+    {
+        if (_geoReader != null)
+        {
+            Logger.LogWarning("{Reason} Keeping the previously loaded GeoLite2 database.", reason);
+        }
+        else
+        {
+            Logger.LogWarning("{Reason} GeoIP placeholders will use unknown values.", reason);
         }
     }
 
@@ -1163,7 +1225,10 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
         var bytes = address.GetAddressBytes();
         return bytes[0] == 10 ||
                (bytes[0] == 172 && bytes[1] >= 16 && bytes[1] <= 31) ||
-               (bytes[0] == 192 && bytes[1] == 168);
+               (bytes[0] == 192 && bytes[1] == 168) ||
+               // CGNAT / Tailscale 100.64.0.0/10 and IPv4 link-local 169.254.0.0/16.
+               (bytes[0] == 100 && bytes[1] >= 64 && bytes[1] <= 127) ||
+               (bytes[0] == 169 && bytes[1] == 254);
     }
 
     private static string FirstEnglishName(IReadOnlyDictionary<string, string> names, string fallback)
@@ -1173,11 +1238,272 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
             : names.Values.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value)) ?? fallback;
     }
 
+    // Generated once by walking AA..ZZ with RegionInfo on Windows (251 entries).
+    private static readonly Dictionary<string, string> Iso3ByIso2 = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["AD"] = "AND",
+        ["AE"] = "ARE",
+        ["AF"] = "AFG",
+        ["AG"] = "ATG",
+        ["AI"] = "AIA",
+        ["AL"] = "ALB",
+        ["AM"] = "ARM",
+        ["AO"] = "AGO",
+        ["AQ"] = "ATA",
+        ["AR"] = "ARG",
+        ["AS"] = "ASM",
+        ["AT"] = "AUT",
+        ["AU"] = "AUS",
+        ["AW"] = "ABW",
+        ["AX"] = "ALA",
+        ["AZ"] = "AZE",
+        ["BA"] = "BIH",
+        ["BB"] = "BRB",
+        ["BD"] = "BGD",
+        ["BE"] = "BEL",
+        ["BF"] = "BFA",
+        ["BG"] = "BGR",
+        ["BH"] = "BHR",
+        ["BI"] = "BDI",
+        ["BJ"] = "BEN",
+        ["BL"] = "BLM",
+        ["BM"] = "BMU",
+        ["BN"] = "BRN",
+        ["BO"] = "BOL",
+        ["BQ"] = "BES",
+        ["BR"] = "BRA",
+        ["BS"] = "BHS",
+        ["BT"] = "BTN",
+        ["BV"] = "BVT",
+        ["BW"] = "BWA",
+        ["BY"] = "BLR",
+        ["BZ"] = "BLZ",
+        ["CA"] = "CAN",
+        ["CC"] = "CCK",
+        ["CD"] = "COD",
+        ["CF"] = "CAF",
+        ["CG"] = "COG",
+        ["CH"] = "CHE",
+        ["CI"] = "CIV",
+        ["CK"] = "COK",
+        ["CL"] = "CHL",
+        ["CM"] = "CMR",
+        ["CN"] = "CHN",
+        ["CO"] = "COL",
+        ["CR"] = "CRI",
+        ["CU"] = "CUB",
+        ["CV"] = "CPV",
+        ["CW"] = "CUW",
+        ["CX"] = "CXR",
+        ["CY"] = "CYP",
+        ["CZ"] = "CZE",
+        ["DE"] = "DEU",
+        ["DJ"] = "DJI",
+        ["DK"] = "DNK",
+        ["DM"] = "DMA",
+        ["DO"] = "DOM",
+        ["DZ"] = "DZA",
+        ["EC"] = "ECU",
+        ["EE"] = "EST",
+        ["EG"] = "EGY",
+        ["ER"] = "ERI",
+        ["ES"] = "ESP",
+        ["ET"] = "ETH",
+        ["FI"] = "FIN",
+        ["FJ"] = "FJI",
+        ["FK"] = "FLK",
+        ["FM"] = "FSM",
+        ["FO"] = "FRO",
+        ["FR"] = "FRA",
+        ["GA"] = "GAB",
+        ["GB"] = "GBR",
+        ["GD"] = "GRD",
+        ["GE"] = "GEO",
+        ["GF"] = "GUF",
+        ["GG"] = "GGY",
+        ["GH"] = "GHA",
+        ["GI"] = "GIB",
+        ["GL"] = "GRL",
+        ["GM"] = "GMB",
+        ["GN"] = "GIN",
+        ["GP"] = "GLP",
+        ["GQ"] = "GNQ",
+        ["GR"] = "GRC",
+        ["GS"] = "SGS",
+        ["GT"] = "GTM",
+        ["GU"] = "GUM",
+        ["GW"] = "GNB",
+        ["GY"] = "GUY",
+        ["HK"] = "HKG",
+        ["HM"] = "HMD",
+        ["HN"] = "HND",
+        ["HR"] = "HRV",
+        ["HT"] = "HTI",
+        ["HU"] = "HUN",
+        ["ID"] = "IDN",
+        ["IE"] = "IRL",
+        ["IL"] = "ISR",
+        ["IM"] = "IMN",
+        ["IN"] = "IND",
+        ["IO"] = "IOT",
+        ["IQ"] = "IRQ",
+        ["IR"] = "IRN",
+        ["IS"] = "ISL",
+        ["IT"] = "ITA",
+        ["JE"] = "JEY",
+        ["JM"] = "JAM",
+        ["JO"] = "JOR",
+        ["JP"] = "JPN",
+        ["KE"] = "KEN",
+        ["KG"] = "KGZ",
+        ["KH"] = "KHM",
+        ["KI"] = "KIR",
+        ["KM"] = "COM",
+        ["KN"] = "KNA",
+        ["KP"] = "PRK",
+        ["KR"] = "KOR",
+        ["KW"] = "KWT",
+        ["KY"] = "CYM",
+        ["KZ"] = "KAZ",
+        ["LA"] = "LAO",
+        ["LB"] = "LBN",
+        ["LC"] = "LCA",
+        ["LI"] = "LIE",
+        ["LK"] = "LKA",
+        ["LR"] = "LBR",
+        ["LS"] = "LSO",
+        ["LT"] = "LTU",
+        ["LU"] = "LUX",
+        ["LV"] = "LVA",
+        ["LY"] = "LBY",
+        ["MA"] = "MAR",
+        ["MC"] = "MCO",
+        ["MD"] = "MDA",
+        ["ME"] = "MNE",
+        ["MF"] = "MAF",
+        ["MG"] = "MDG",
+        ["MH"] = "MHL",
+        ["MK"] = "MKD",
+        ["ML"] = "MLI",
+        ["MM"] = "MMR",
+        ["MN"] = "MNG",
+        ["MO"] = "MAC",
+        ["MP"] = "MNP",
+        ["MQ"] = "MTQ",
+        ["MR"] = "MRT",
+        ["MS"] = "MSR",
+        ["MT"] = "MLT",
+        ["MU"] = "MUS",
+        ["MV"] = "MDV",
+        ["MW"] = "MWI",
+        ["MX"] = "MEX",
+        ["MY"] = "MYS",
+        ["MZ"] = "MOZ",
+        ["NA"] = "NAM",
+        ["NC"] = "NCL",
+        ["NE"] = "NER",
+        ["NF"] = "NFK",
+        ["NG"] = "NGA",
+        ["NI"] = "NIC",
+        ["NL"] = "NLD",
+        ["NO"] = "NOR",
+        ["NP"] = "NPL",
+        ["NR"] = "NRU",
+        ["NU"] = "NIU",
+        ["NZ"] = "NZL",
+        ["OM"] = "OMN",
+        ["PA"] = "PAN",
+        ["PE"] = "PER",
+        ["PF"] = "PYF",
+        ["PG"] = "PNG",
+        ["PH"] = "PHL",
+        ["PK"] = "PAK",
+        ["PL"] = "POL",
+        ["PM"] = "SPM",
+        ["PN"] = "PCN",
+        ["PR"] = "PRI",
+        ["PS"] = "PSE",
+        ["PT"] = "PRT",
+        ["PW"] = "PLW",
+        ["PY"] = "PRY",
+        ["QA"] = "QAT",
+        ["RE"] = "REU",
+        ["RO"] = "ROU",
+        ["RS"] = "SRB",
+        ["RU"] = "RUS",
+        ["RW"] = "RWA",
+        ["SA"] = "SAU",
+        ["SB"] = "SLB",
+        ["SC"] = "SYC",
+        ["SD"] = "SDN",
+        ["SE"] = "SWE",
+        ["SG"] = "SGP",
+        ["SH"] = "SHN",
+        ["SI"] = "SVN",
+        ["SJ"] = "SJM",
+        ["SK"] = "SVK",
+        ["SL"] = "SLE",
+        ["SM"] = "SMR",
+        ["SN"] = "SEN",
+        ["SO"] = "SOM",
+        ["SR"] = "SUR",
+        ["SS"] = "SSD",
+        ["ST"] = "STP",
+        ["SV"] = "SLV",
+        ["SX"] = "SXM",
+        ["SY"] = "SYR",
+        ["SZ"] = "SWZ",
+        ["TC"] = "TCA",
+        ["TD"] = "TCD",
+        ["TF"] = "ATF",
+        ["TG"] = "TGO",
+        ["TH"] = "THA",
+        ["TJ"] = "TJK",
+        ["TK"] = "TKL",
+        ["TL"] = "TLS",
+        ["TM"] = "TKM",
+        ["TN"] = "TUN",
+        ["TO"] = "TON",
+        ["TR"] = "TUR",
+        ["TT"] = "TTO",
+        ["TV"] = "TUV",
+        ["TW"] = "TWN",
+        ["TZ"] = "TZA",
+        ["UA"] = "UKR",
+        ["UG"] = "UGA",
+        ["UM"] = "UMI",
+        ["US"] = "USA",
+        ["UY"] = "URY",
+        ["UZ"] = "UZB",
+        ["VA"] = "VAT",
+        ["VC"] = "VCT",
+        ["VE"] = "VEN",
+        ["VG"] = "VGB",
+        ["VI"] = "VIR",
+        ["VN"] = "VNM",
+        ["VU"] = "VUT",
+        ["WF"] = "WLF",
+        ["WS"] = "WSM",
+        ["XK"] = "XKX",
+        ["YE"] = "YEM",
+        ["YT"] = "MYT",
+        ["ZA"] = "ZAF",
+        ["ZM"] = "ZMB",
+        ["ZW"] = "ZWE"
+    };
+
     private static string ToIso3(string iso2)
     {
         if (string.IsNullOrWhiteSpace(iso2))
         {
             return "???";
+        }
+
+        // Linux servers often run with invariant globalization, where RegionInfo throws for
+        // every code, so the common case is answered from a static table.
+        if (Iso3ByIso2.TryGetValue(iso2.Trim(), out var known))
+        {
+            return known;
         }
 
         try
@@ -1242,7 +1568,7 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
             17 => "Does not own the game",
             18 => "Info data overflow",
             23 or 24 or 26 => "Buffer overflow",
-            29 or 72 => "Could not connect to server",
+            72 => "Could not connect to server",
             30 or 84 or 85 => "Disconnected",
             39 => "Kicked by server",
             40 => "Added to ban list",
@@ -1270,7 +1596,7 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
             68 => "Connection denied by VAC",
             69 => "Server shutting down",
             73 => "Incompatible server version",
-            74 or 77 or 79 or 80 or 81 => "Timed out",
+            29 or 74 or 77 or 79 or 80 or 81 => "Timed out",
             75 => "Server lost relay connection",
             76 => "Could not download network configuration",
             128 => "Bad challenge",

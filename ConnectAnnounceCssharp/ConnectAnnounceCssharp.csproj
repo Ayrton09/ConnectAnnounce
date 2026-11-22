@@ -4,15 +4,15 @@
     <TargetFramework>net10.0</TargetFramework>
     <AssemblyName>ConnectAnnounce</AssemblyName>
     <RootNamespace>ConnectAnnounce</RootNamespace>
-    <Version>1.0.7</Version>
+    <Version>1.0.8</Version>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="CounterStrikeSharp.API" Version="1.0.375" PrivateAssets="all" ExcludeAssets="runtime" />
-    <PackageReference Include="MaxMind.GeoIP2" Version="5.4.1" />
+    <PackageReference Include="CounterStrikeSharp.API" Version="1.0.380" PrivateAssets="all" ExcludeAssets="runtime" />
+    <PackageReference Include="MaxMind.GeoIP2" Version="6.2.0" />
   </ItemGroup>
 
   <ItemGroup>

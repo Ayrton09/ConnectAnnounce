@@ -6,9 +6,55 @@
 /ConnectAnnounce/
 /deploy/
 /release/
+*.zip
 
 # Legacy SourceMod plugin source kept locally as porting reference.
 /sourcemod/
 
 # GeoLite2 downloads are generated outside this repo and must be kept updated.
-GeoLite2-City.mmdb
+*.mmdb
+
+# Real runtime config (may hold server-specific values).
+ConnectAnnounceConfig.json
+
+# Private keys and certificates
+*.pem
+*.key
+*.pfx
+*.p12
+*.ppk
+id_rsa*
+id_ed25519*
+
+# Environment files (only the example is tracked)
+.env
+.env.*
+!.env.example
+
+# Tokens and credentials
+*token*.txt
+credentials*.json
+secrets*.json
+*.secret
+
+# Local databases
+*.db
+*.sqlite*
+*.db-journal
+*-wal
+*-shm
+
+# Logs
+*.log
+logs/
+
+# Backups
+*.bak
+*.backup
+*.orig
+*~
+
+# Assistant and editor folders
+.claude/
+.vs/
+.idea/
