@@ -11,7 +11,7 @@ A CounterStrikeSharp plugin for CS2 that replaces the game's connect and disconn
 
 ```text
 Ayrton09 connected from Argentina | Buenos Aires
-Ayrton09 (STEAM_1:1:37229756) disconnected! reason: Disconnected by user
+Ayrton09 (STEAM_1:1:37229756) disconnected! reason: Disconnected
 [ADMIN] SomeAdmin connected from the United States | Chicago
 ```
 
@@ -58,10 +58,7 @@ Keep your own `data/cannounce_settings.txt` if you have customized it. `ConnectA
 
 ### Updating the GeoIP database
 
-The bundled database is current as of each release. To refresh it later, download a new `GeoLite2-City.mmdb` from one of these links:
-
-- https://git.io/GeoLite2-City.mmdb
-- https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-City.mmdb
+The bundled database is current as of each release. To refresh it later, download a new `GeoLite2-City.mmdb`. The official source is MaxMind, which needs a free account: https://dev.maxmind.com/geoip/geolite2-free-geolocation-data. A community mirror that republishes it without an account is https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-City.mmdb. The data is covered by the [GeoLite EULA](https://www.maxmind.com/en/geolite2/eula) either way (see [Third-party notices](#third-party-notices)).
 
 Replace the file in the plugin folder and run `css_ca_reload`:
 
@@ -93,6 +90,8 @@ Templates live in `ConnectAnnounce/data/cannounce_settings.txt`:
 
 `messages` is the regular block. `messages_admin` is used as described in [Admin announcements](#admin-announcements). Edit the file and run `css_ca_reload` to apply changes.
 
+The file is checked strictly, because its text goes to every player's chat. A missing closing quote, a missing or duplicated root section, unbalanced braces, or a key with no value is rejected with the line number in the server log. A value cannot contain a line break. Inside quotes only `\"` and `\\` are escapes; any other backslash is kept as typed (`\n` is the two characters `\n`, not a new line). A rejected file is handled like an invalid config: on startup there are no announcements until `css_ca_reload` succeeds, and on a reload the previous templates stay active and `css_ca_reload` reports that it failed.
+
 ### Placeholders
 
 | Placeholder | Example | Color key |
@@ -108,13 +107,13 @@ Templates live in `ConnectAnnounce/data/cannounce_settings.txt`:
 | `{PLAYERIP}` | `203.0.113.9` | `PlayerIpColor` |
 | `{PLAYERTYPE}` | `Admin` or `Player` | `PlayerTypeColor` |
 | `{DISC_REASON_LABEL}` | `reason: ` | `DisconnectReasonLabelColor` |
-| `{DISC_REASON}` | `Disconnected by user`, `Timed out`, `Kicked` | `DisconnectReasonColor` |
+| `{DISC_REASON}` | `Disconnected`, `Timed out`, `Kicked by server` | `DisconnectReasonColor` |
 
-`{PLAYERCOUNTRY}` adds "the" where English needs it (`the United States`, `the Netherlands`). The disconnect placeholders are empty in join messages.
+`{PLAYERCOUNTRY}` adds "the" where English needs it (`the United States`, `the Netherlands`), always in lowercase so it reads right mid-sentence. The disconnect placeholders are empty in join messages.
 
 When an address cannot be located, the location placeholders show `an Unknown Country`, `an Unknown Region`, `Somewhere`, `??` and `???`. Players on a local network get their own wording (see [Players on a local network](#players-on-a-local-network)).
 
-A player name is never parsed for placeholders or color tags, so a name like `{PLAYERIP}` or `{Red}` is shown literally.
+A player name is never parsed for placeholders or color tags, so a name like `{PLAYERIP}` or `{Red}` is shown literally. Control characters in a name (below 0x20, and DEL) are removed first, so a name cannot recolor or split the announcement.
 
 ## Configuration
 
@@ -195,6 +194,8 @@ Anything other than `"Recipient"` behaves as `"Subject"`; a value that is set bu
 
 Set `AdminFlag` to whatever flag your admins actually have, e.g. `@css/ban`. Players with `@css/root` always count as admin. The flag also drives `{PLAYERTYPE}`.
 
+`AdminFlag` must start with `@` (`@css/ban`, not `css/ban`). A value without it is logged as a warning and the default `@css/generic` is used instead, because CounterStrikeSharp answers "yes" to a flag in that shape for every player listed in `admins.json`, which would make all of them count as admin.
+
 ### Players on a local network
 
 Private and local addresses are in no GeoIP database. That covers `192.168.x`, `10.x`, `172.16-31.x`, loopback, CGNAT and Tailscale (`100.64.0.0/10`), IPv4 link-local (`169.254.x`) and their IPv6 equivalents, including link-local `fe80::/10`. Players on those addresses are announced as *connected from a Local Area Network | an IP Address*.
@@ -260,7 +261,7 @@ An invalid color name is reported in the server log. On startup that leaves anno
 
 A disconnect is only announced for a player whose arrival the plugin recorded. Clients turned away before Steam authorizes them (a reserved-slot plugin rejecting a non-VIP from a full server, a ban or whitelist check that runs that early) never get recorded, so they do not produce a stream of "disconnected" lines for players who were never really on the server.
 
-Players already connected when the plugin is loaded or reloaded are recorded at that moment, so their departures are still announced.
+Players already connected when the plugin is loaded or reloaded are recorded at that moment, so their departures are still announced. That includes players who are authorized but still loading the map. Players who are not authorized yet are recorded when Steam authorizes them.
 
 Reconnects caused by addon downloads (MultiAddonManager or forced workshop downloads) are recognised and announced only once.
 
@@ -271,14 +272,27 @@ Reconnects caused by addon downloads (MultiAddonManager or forced workshop downl
 | `css_geolist <target>` | `@css/generic` | Print the location of the target(s). |
 | `css_ca_reload` | `@css/root` | Reload the templates, the config and the GeoIP database. |
 
-`@css/root` satisfies both. A target is a name substring, `#userid`, a SteamID, `@me` or `@all`. Both commands also work from the server console.
+`@css/root` satisfies both. Both commands also work from the server console.
+
+A `css_geolist` target is one of:
+
+| Target | Example |
+| --- | --- |
+| Name substring (the whole text after the command, so spaces work) | `css_geolist John Doe` |
+| `#userid` | `css_geolist #3` |
+| SteamID64 | `css_geolist 76561198034725241` |
+| SteamID2, `STEAM_0` or `STEAM_1` | `css_geolist STEAM_1:1:37229756` |
+| SteamID3 | `css_geolist [U:1:74459513]` |
+| `@me` or `@all` | `css_geolist @all` |
+
+A purely numeric target that matches no SteamID is then tried as part of a name.
 
 ## Troubleshooting
 
 | Symptom | Cause |
 | --- | --- |
 | Every player shows `an Unknown Country` | The database did not load. Look for `GeoLite2` in the CounterStrikeSharp log, check `GeoLiteDatabasePath` and that the file is a City database. |
-| No announcements at all after a config change | A color name is invalid. The log names the key; fix it and run `css_ca_reload`. |
+| No announcements at all after the server starts | The config JSON or `cannounce_settings.txt` is invalid (an unknown color name, malformed JSON, an unclosed quote or brace). The log names the problem and the line; fix it and run `css_ca_reload`. On a later `css_ca_reload` an invalid file does not silence anything: the previous settings stay active and the command reports that the reload failed. |
 | A new config key has no effect | The config is never rewritten. Add the key by hand or delete the file to regenerate it. |
 | The plugin does not load | Only `ConnectAnnounce.dll` was copied, or CounterStrikeSharp is older than 1.0.375. Copy the whole folder. |
 | `{PLAYERCOUNTRYSHORT3}` shows `???` for LAN players | `LanCountryCode` is not a valid two-letter country code. |
@@ -290,4 +304,14 @@ See [ConnectAnnounceCssharp/README.md](ConnectAnnounceCssharp/README.md).
 
 ## License
 
-[MIT](LICENSE)
+The plugin code is [MIT](LICENSE). The GeoLite2 database and the libraries shipped with the plugin are not covered by that license; see below.
+
+## Third-party notices
+
+This product includes GeoLite Data created by MaxMind, available from https://www.maxmind.com
+
+- The GeoLite2 data is distributed under the [GeoLite EULA](https://www.maxmind.com/en/geolite2/eula), and its copyrightable elements are licensed under [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/).
+- `MaxMind.GeoIP2` and `MaxMind.Db` are Copyright MaxMind, Inc. and licensed under the Apache License 2.0.
+- `Microsoft.Extensions.*` are Copyright Microsoft Corporation and licensed under the MIT license.
+
+The full notices, with the license texts, are in [`ConnectAnnounceCssharp/THIRD-PARTY-NOTICES.txt`](ConnectAnnounceCssharp/THIRD-PARTY-NOTICES.txt), which is also shipped in the plugin folder of every release.

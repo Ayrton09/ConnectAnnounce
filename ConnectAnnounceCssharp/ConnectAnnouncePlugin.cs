@@ -23,29 +23,38 @@ namespace ConnectAnnounceCssharp;
 [MinimumApiVersion(375)]
 public sealed class ConnectAnnouncePlugin : BasePlugin
 {
-    private const string Version = "1.0.8";
-    private const ulong SteamId64Base = 76561197960265728UL;
+    private const string Version = "1.0.9";
+    internal const ulong SteamId64Base = 76561197960265728UL;
     private static readonly Regex PlaceholderPattern = new(@"\{[A-Za-z0-9_]+\}", RegexOptions.Compiled);
 
     private readonly object _fileLock = new();
     private readonly object _geoLock = new();
-    // When each player was last seen arriving or leaving transiently. A reconnect inside
-    // this window is treated as the same arrival (map change, or a forced addon-download
-    // reconnect loop) and is not announced again; a player returning after it is a genuine
-    // new arrival. Because the entry ages out on its own, a player who leaves for good can
-    // never get stuck permanently un-announceable, which is what keying on "is this player
-    // still connected" used to cause.
+    // When each player was last seen arriving or leaving transiently, as Environment.TickCount64
+    // milliseconds. A monotonic clock on purpose: with wall-clock time a clock that steps
+    // backwards (NTP, a manual change) would make every entry look newer than now and
+    // suppress genuine arrivals. A reconnect inside this window is treated as the same
+    // arrival (map change, or a forced addon-download reconnect loop) and is not announced
+    // again; a player returning after it is a genuine new arrival. Because the entry ages
+    // out on its own, a player who leaves for good can never get stuck permanently
+    // un-announceable, which is what keying on "is this player still connected" used to cause.
     // The window covers a single reconnect hop rather than a whole download chain: every
     // hop stamps the entry again, so five minutes is generous.
-    private static readonly TimeSpan AnnounceWindow = TimeSpan.FromMinutes(5);
-    private readonly Dictionary<ulong, DateTime> _lastSeenAt = [];
+    private const long AnnounceWindowMs = 5 * 60 * 1000;
+    private readonly Dictionary<ulong, long> _lastSeenAt = [];
 
-    // Last SteamID seen on each slot. AuthorizedSteamID stops resolving on a controller
-    // that is being torn down, which is exactly when the disconnect path needs it, so keep
-    // our own copy from authorization time. Paired with the UserId of the connection it was
-    // recorded for, because slots are reused: without that check a client that disconnects
-    // before authorizing would resolve to whoever held the slot last. Bounded by slot count.
-    private readonly Dictionary<int, (int UserId, ulong Steam64)> _slotSteamIds = [];
+    private static long NowMs => Environment.TickCount64;
+
+    // Last SteamID and address seen on each slot. AuthorizedSteamID stops resolving on a
+    // controller that is being torn down, which is exactly when the disconnect path needs it,
+    // so keep our own copy from authorization time (the address gets the same treatment).
+    // Paired with the UserId of the connection it was recorded for, because slots are
+    // reused: without that check a client that disconnects before authorizing would resolve
+    // to whoever held the slot last. The entry is also dropped whenever a new client starts
+    // connecting on the slot (OnClientConnect), because in CS2 the userid is just the slot
+    // number and so does not tell two occupants of the same slot apart. Bounded by slot count.
+    private readonly Dictionary<int, SlotRecord> _slotSteamIds = [];
+
+    private readonly record struct SlotRecord(int UserId, ulong Steam64, string Ip);
     private ConnectAnnounceConfig _config = new();
     private KeyValuesNode _countryShow = new("CountryShow");
     private DatabaseReader? _geoReader;
@@ -61,8 +70,8 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
     // reasons like "Timed out" that are indistinguishable from a real departure. Treat
     // the first moments of a map as still transitioning so those are not announced as
     // arrivals and departures. Replaces a timer that used to clear _mapChanging late.
-    private static readonly TimeSpan MapSettleWindow = TimeSpan.FromSeconds(15);
-    private DateTime _mapStartedAt = DateTime.MinValue;
+    private const long MapSettleWindowMs = 15 * 1000;
+    private long? _mapStartedAt;
     private volatile bool _unloaded;
     private string _dataDirectory = "";
     private string _settingsPath = "";
@@ -96,6 +105,7 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
 
         RegisterEventHandler<EventPlayerConnect>(OnPlayerConnectPre, HookMode.Pre);
         RegisterEventHandler<EventPlayerDisconnect>(OnPlayerDisconnectPre, HookMode.Pre);
+        RegisterListener<Listeners.OnClientConnect>(OnClientConnect);
         RegisterListener<Listeners.OnClientAuthorized>(OnClientAuthorized);
         RegisterListener<Listeners.OnMapStart>(OnMapStart);
         RegisterListener<Listeners.OnMapEnd>(OnMapEnd);
@@ -132,51 +142,66 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
     // be silent.
     private void SeedPlayersAlreadyHere()
     {
-        List<CCSPlayerController> players;
-        try
-        {
-            players = GetRealPlayers().ToList();
-        }
-        catch (Exception ex)
-        {
-            Logger.LogWarning(ex, "Could not list the players already on the server.");
-            return;
-        }
-
-        var now = DateTime.UtcNow;
+        // Walk the slots directly instead of Utilities.GetPlayers: that only returns
+        // controllers in the Connected state, and a player who is already authorized but
+        // still loading (OnClientAuthorized fires once per connection and will not fire
+        // again) is not Connected yet, so they would never be recorded and their departure
+        // would go unannounced. Anyone not authorized yet is skipped here on purpose: they
+        // are recorded by OnClientAuthorized when it fires. Recording them here first would
+        // make that announcement look like a repeat and silence it.
+        var now = NowMs;
         var recorded = 0;
-        foreach (var player in players)
+        for (var slot = 0; slot < SlotScanLimit; slot++)
         {
             try
             {
-                // Someone still joining is recorded by OnClientAuthorized. Recording them here
-                // first would make that announcement look like a repeat and silence it.
-                if (player.Connected != PlayerConnectedState.Connected)
+                var player = Utilities.GetPlayerFromSlot(slot);
+                if (!IsConnectingPlayer(player))
                 {
                     continue;
                 }
 
-                var steam64 = ResolveSteamId(player);
+                // Someone on their way out still has a readable SteamID. Recording them here
+                // would outlive their departure and silence their next arrival.
+                if (player!.Connected is PlayerConnectedState.Disconnecting or PlayerConnectedState.Disconnected)
+                {
+                    continue;
+                }
+
+                var steam64 = ReadAuthorizedSteam64(player!);
                 if (!steam64.HasValue)
                 {
                     continue;
                 }
 
                 _lastSeenAt[steam64.Value] = now;
-                if (player.UserId is { } userId)
+                if (player!.UserId is { } userId)
                 {
-                    _slotSteamIds[player.Slot] = (userId, steam64.Value);
+                    _slotSteamIds[slot] = new SlotRecord(userId, steam64.Value, ReadIp(player));
                 }
 
                 recorded++;
             }
             catch (Exception ex)
             {
-                Logger.LogWarning(ex, "Could not record a player already on the server.");
+                Logger.LogWarning(ex, "Could not record the player on slot {Slot} already on the server.", slot);
             }
         }
 
         Logger.LogInformation("Registered {Count} player(s) already on the server.", recorded);
+    }
+
+    // Every slot the engine can have. Server.MaxPlayers is deliberately not read here: before
+    // 1.0.379 CounterStrikeSharp caches its first answer for every plugin, so reading it at
+    // the wrong moment could stick a bad value. Empty slots just return no controller.
+    private const int SlotScanLimit = 64;
+
+    // A new client is starting to connect on this slot, so whatever we cached belongs to
+    // the previous occupant. Runs for every attempt, including ones that get rejected before
+    // authorization, which is exactly the case where the stale entry would otherwise be used.
+    private void OnClientConnect(int playerSlot, string name, string ipAddress)
+    {
+        _slotSteamIds.Remove(playerSlot);
     }
 
     public override void Unload(bool hotReload)
@@ -194,15 +219,15 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
     private void OnMapStart(string mapName)
     {
         _mapChanging = false;
-        _mapStartedAt = DateTime.UtcNow;
+        _mapStartedAt = NowMs;
 
         // Drop entries that have aged out. Players who stayed are stamped in OnMapEnd and
         // again by their transition disconnect, and re-authorizing on the new map stamps
         // them a third time, so this should only reach players who are gone. If all of those
         // miss someone who is still here, they are announced arriving once more and their
         // eventual departure goes unannounced, because a departure needs a recorded arrival.
-        var cutoff = DateTime.UtcNow - AnnounceWindow;
-        foreach (var steam64 in _lastSeenAt.Where(entry => entry.Value < cutoff).Select(entry => entry.Key).ToList())
+        var now = NowMs;
+        foreach (var steam64 in _lastSeenAt.Where(entry => now - entry.Value >= AnnounceWindowMs).Select(entry => entry.Key).ToList())
         {
             _lastSeenAt.Remove(steam64);
         }
@@ -232,7 +257,7 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
             return;
         }
 
-        var now = DateTime.UtcNow;
+        var now = NowMs;
         foreach (var player in players)
         {
             // One controller that is already tearing down must not abort the loop and
@@ -259,27 +284,59 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
     // previous occupant's SteamID.
     private ulong? ResolveSteamId(CCSPlayerController player)
     {
-        ulong? steam64;
-        try
-        {
-            steam64 = player.AuthorizedSteamID?.SteamId64;
-        }
-        catch (Exception)
-        {
-            // Reading it off a controller that is going away can throw rather than return
-            // null. That is exactly the case the cache below exists for, so fall through
-            // instead of losing the announcement.
-            steam64 = null;
-        }
-
+        var steam64 = ReadAuthorizedSteam64(player);
         if (steam64.HasValue)
         {
             return steam64;
         }
 
-        return _slotSteamIds.TryGetValue(player.Slot, out var cached) && cached.UserId == player.UserId
-            ? cached.Steam64
-            : null;
+        return TryGetCachedSlot(player, out var cached) ? cached.Steam64 : null;
+    }
+
+    // Reading it off a controller that is going away can throw rather than return null.
+    // That is exactly the case the slot cache exists for, so swallow it and let the caller
+    // fall back instead of losing the announcement.
+    private static ulong? ReadAuthorizedSteam64(CCSPlayerController player)
+    {
+        try
+        {
+            return player.AuthorizedSteamID?.SteamId64;
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    // The address as the controller reports it right now, or empty when it cannot be read.
+    private static string ReadIp(CCSPlayerController player)
+    {
+        try
+        {
+            return ExtractIp(player.IpAddress);
+        }
+        catch (Exception)
+        {
+            return "";
+        }
+    }
+
+    private bool TryGetCachedSlot(CCSPlayerController player, out SlotRecord cached)
+    {
+        try
+        {
+            if (_slotSteamIds.TryGetValue(player.Slot, out cached) && cached.UserId == player.UserId)
+            {
+                return true;
+            }
+        }
+        catch (Exception)
+        {
+            // A controller that is going away can throw on Slot or UserId too.
+        }
+
+        cached = default;
+        return false;
     }
 
     private HookResult OnPlayerConnectPre(EventPlayerConnect @event, GameEventInfo info)
@@ -326,23 +383,26 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
         }
 
         // Record the player FIRST. Their departure is only announced if this entry exists, so
-        // nothing that can fail — every controller property is a native read — may run ahead
+        // nothing that can fail (every controller property is a native read) may run ahead
         // of it and cost them their leaving message.
         // The timestamp is refreshed on every authorization, including suppressed ones, so a
         // long chain of reconnects keeps sliding the window instead of ageing out midway and
         // announcing the same arrival twice.
         var steam64 = steamId.SteamId64;
-        var now = DateTime.UtcNow;
+        var now = NowMs;
         var alreadyAnnounced = _lastSeenAt.TryGetValue(steam64, out var lastAnnounced) &&
-                               now - lastAnnounced < AnnounceWindow;
+                               now - lastAnnounced < AnnounceWindowMs;
         _lastSeenAt[steam64] = now;
 
-        // Best-effort: only used as a fallback when AuthorizedSteamID stops resolving later.
+        // Best-effort: only used as a fallback when AuthorizedSteamID (or the address) stops
+        // resolving later.
+        var ip = "";
         try
         {
+            ip = ReadIp(player!);
             if (player!.UserId is { } userId)
             {
-                _slotSteamIds[playerSlot] = (userId, steam64);
+                _slotSteamIds[playerSlot] = new SlotRecord(userId, steam64, ip);
             }
         }
         catch (Exception ex)
@@ -360,7 +420,7 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
             var subjectIsAdmin = IsAdmin(steamId);
             var playerMsg = GetCountryMessage("messages", "playerjoin");
             var adminMsg = GetCountryMessage("messages_admin", "playerjoin");
-            PrintEnhancedMessage(player!, subjectIsAdmin, playerMsg, adminMsg, steam64);
+            PrintEnhancedMessage(player!, subjectIsAdmin, playerMsg, adminMsg, steam64, null, ip);
         }
     }
 
@@ -406,12 +466,13 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
         // forward so that re-authorization lands inside the announce window instead of
         // looking like a new arrival. Written unconditionally rather than only refreshing
         // an existing entry, so it still holds if the sweep already removed it.
-        var settling = DateTime.UtcNow - _mapStartedAt < MapSettleWindow;
+        var now = NowMs;
+        var settling = _mapStartedAt is { } startedAt && now - startedAt < MapSettleWindowMs;
         if (_mapChanging || settling || IsTransientDisconnectReason(@event.Reason))
         {
             if (steam64.HasValue)
             {
-                _lastSeenAt[steam64.Value] = DateTime.UtcNow;
+                _lastSeenAt[steam64.Value] = now;
             }
 
             return;
@@ -423,13 +484,17 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
         }
 
         // Only announce a departure for someone whose arrival we know about. A client that
-        // is authorized and then immediately rejected — a reserved-slot plugin turning away
-        // a non-VIP from a full server, a ban check, a whitelist — was never announced
+        // is authorized and then immediately rejected (a reserved-slot plugin turning away
+        // a non-VIP from a full server, a ban check, a whitelist) was never announced
         // arriving, and announcing it produces a stream of "disconnected" lines for players
         // who were never really here. An entry exists for anyone announced arriving, present
         // at a map change, or already connected when the plugin loaded, so a genuine
         // departure is never lost.
         var hadArrived = _lastSeenAt.Remove(steam64.Value);
+
+        // The address recorded at authorization, used if the controller no longer reports
+        // one. Read before the slot entry is dropped below.
+        var cachedIp = TryGetCachedSlot(player!, out var cachedSlot) ? cachedSlot.Ip : "";
         _slotSteamIds.Remove(player!.Slot);
 
         if (hadArrived && _config.ShowEnhancedDisconnectMessage)
@@ -441,7 +506,7 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
             var reason = GetDisconnectReason(@event.Reason);
             var playerMsg = GetCountryMessage("messages", "playerdisc");
             var adminMsg = GetCountryMessage("messages_admin", "playerdisc");
-            PrintEnhancedMessage(player!, subjectIsAdmin, playerMsg, adminMsg, steam64.Value, reason);
+            PrintEnhancedMessage(player!, subjectIsAdmin, playerMsg, adminMsg, steam64.Value, reason, cachedIp);
         }
     }
 
@@ -455,11 +520,13 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
 
         if (command.ArgCount < 2)
         {
-            command.ReplyToCommand("[CA] Usage: css_geolist <name, #userid, steamid, @me or @all>");
+            command.ReplyToCommand("[CA] Usage: css_geolist <name, #userid, SteamID64, STEAM_1:x:y, [U:1:n], @me or @all>");
             return;
         }
 
-        var pattern = command.ArgByIndex(1);
+        // The whole argument string, so a name with spaces works without quotes. Falls back
+        // to the first argument if the string comes back empty.
+        var pattern = TargetPatterns.NormalizePattern(command.ArgString, () => command.ArgByIndex(1));
         var targets = FindTargets(caller, pattern).ToList();
         if (targets.Count == 0)
         {
@@ -475,7 +542,7 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
         foreach (var target in targets)
         {
             var location = LookupLocation(target);
-            command.ReplyToCommand($"{target.PlayerName} from {location.City} in {location.Region}/{location.Country}");
+            command.ReplyToCommand($"{TargetPatterns.SanitizeName(target.PlayerName)} from {location.City} in {location.Region}/{location.Country}");
         }
     }
 
@@ -487,21 +554,26 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
             return;
         }
 
-        LoadAllFiles();
+        // The return value, not _filesLoaded: after a failed reload _filesLoaded still holds
+        // the previous state (true when announcements were already running), but the
+        // command has to say that this reload did not apply.
+        var succeeded = LoadAllFiles();
 
-        if (_filesLoaded)
+        if (succeeded)
         {
             // Players who connected while the files were not loaded were never recorded, so
             // pick them up now rather than letting their departure go unannounced.
             SeedPlayersAlreadyHere();
         }
 
-        command.ReplyToCommand(_filesLoaded
+        command.ReplyToCommand(succeeded
             ? "[CA] Reloaded Connect Announce configuration."
-            : "[CA] Reload failed. Check the server log for the exact error.");
+            : _filesLoaded
+                ? "[CA] Reload failed. The previous settings stay active. Check the server log for the exact error."
+                : "[CA] Reload failed. Announcements are still off. Check the server log for the exact error.");
     }
 
-    private void PrintEnhancedMessage(CCSPlayerController subject, bool subjectIsAdmin, string playerMessage, string adminMessage, ulong? steam64 = null, string? disconnectReason = null)
+    private void PrintEnhancedMessage(CCSPlayerController subject, bool subjectIsAdmin, string playerMessage, string adminMessage, ulong? steam64 = null, string? disconnectReason = null, string? ipFallback = null)
     {
         // Two ways to use the admin template, chosen by AdminMessageMode:
         //   Subject   - the whole server sees the admin template when the player who
@@ -513,13 +585,13 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
         var perRecipient = enhancedForAdmins && UseRecipientAdminMessages;
 
         // Format up front, while the subject is still readable. Recipient mode needs both
-        // variants, but each is still built exactly once here — never once per recipient,
+        // variants, but each is still built exactly once here, never once per recipient,
         // which would repeat the GeoIP lookup for every player on the server.
         var publicLine = FormatMessage(
             !perRecipient && enhancedForAdmins && subjectIsAdmin ? adminMessage : playerMessage,
-            subject, subjectIsAdmin, steam64, disconnectReason);
+            subject, subjectIsAdmin, steam64, disconnectReason, ipFallback);
         var adminLine = perRecipient
-            ? FormatMessage(adminMessage, subject, subjectIsAdmin, steam64, disconnectReason)
+            ? FormatMessage(adminMessage, subject, subjectIsAdmin, steam64, disconnectReason, ipFallback)
             : null;
 
         // Capture the logger and the flag rather than reaching for members from inside the
@@ -578,7 +650,7 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
         });
     }
 
-    private string FormatMessage(string rawMessage, CCSPlayerController? player, bool isAdmin, ulong? steam64Override = null, string? disconnectReason = null)
+    private string FormatMessage(string rawMessage, CCSPlayerController? player, bool isAdmin, ulong? steam64Override = null, string? disconnectReason = null, string? ipFallback = null)
     {
         var message = ApplyColorTags(rawMessage);
         if (player == null)
@@ -587,8 +659,15 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
         }
 
         // Read the address once and reuse it: every property read on a controller is a
-        // native round-trip, and this runs inside the connect/disconnect path.
-        var ip = ExtractIp(player.IpAddress);
+        // native round-trip, and this runs inside the connect/disconnect path. On a
+        // controller that is going away the read can come back empty (or throw), so fall
+        // back to the address recorded when the player authorized.
+        var ip = ReadIp(player);
+        if (string.IsNullOrEmpty(ip) && !string.IsNullOrEmpty(ipFallback))
+        {
+            ip = ipFallback;
+        }
+
         var location = LookupLocation(ip);
         var steam64 = steam64Override ?? player.AuthorizedSteamID?.SteamId64;
         var steamKey = steam64 == null ? "" : ToSteam2(steam64.Value, universe: 1);
@@ -603,7 +682,7 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
 
         var replacements = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
-            ["{PLAYERNAME}"] = ChatColorTagExtensions.Colorize(_config.PlayerNameColor, player.PlayerName),
+            ["{PLAYERNAME}"] = ChatColorTagExtensions.Colorize(_config.PlayerNameColor, TargetPatterns.SanitizeName(player.PlayerName)),
             ["{STEAMID}"] = ChatColorTagExtensions.Colorize(_config.SteamIdColor, steamKey),
             ["{STEAMID64}"] = ChatColorTagExtensions.Colorize(_config.SteamIdColor, steamId64),
             ["{PLAYERCOUNTRY}"] = ChatColorTagExtensions.Colorize(countryColor, AddThePrefix(location.Country, location.CountryCode2)),
@@ -625,10 +704,10 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
 
     private GeoLocation LookupLocation(CCSPlayerController player)
     {
-        return LookupLocation(ExtractIp(player.IpAddress));
+        return LookupLocation(ReadIp(player));
     }
 
-    // A private address carries no location — it is not in any GeoIP database — so the
+    // A private address carries no location (it is not in any GeoIP database), so the
     // plugin substitutes fixed text. A server whose players are all on one network can
     // replace that with the real place instead. Each part is optional and keeps its
     // original wording when left empty.
@@ -675,7 +754,7 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
             return new GeoLocation(
                 FirstEnglishName(city.City.Names, "Somewhere"),
                 FirstEnglishName(city.MostSpecificSubdivision.Names, "an Unknown Region"),
-                city.Country.Name ?? "an Unknown Country",
+                LowercaseLeadingThe(city.Country.Name) ?? "an Unknown Country",
                 string.IsNullOrWhiteSpace(countryCode) ? "??" : countryCode,
                 ToIso3(countryCode));
         }
@@ -702,7 +781,8 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
         }
     }
 
-    private void LoadAllFiles()
+    // Returns whether every file loaded in this call.
+    private bool LoadAllFiles()
     {
         lock (_fileLock)
         {
@@ -710,7 +790,7 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
             // half-parsed file live. The sequence as a whole is not atomic though: an
             // earlier step may already have applied while a later one failed, so the log
             // says the state is mixed rather than claiming nothing changed. Staying loaded
-            // beats going silent — a reload of a bad file should not be worse than not
+            // beats going silent: a reload of a bad file should not be worse than not
             // reloading at all.
             var wasLoaded = _filesLoaded;
 
@@ -720,13 +800,15 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
                 LoadCountryMessages();
                 LoadGeoDatabase();
                 _filesLoaded = true;
+                return true;
             }
             catch (Exception ex)
             {
                 _filesLoaded = wasLoaded;
                 Logger.LogError(ex, wasLoaded
                     ? "Connect Announce could not finish reloading. Announcements stay on, but some settings may still be the previous ones. Fix the error above and run css_ca_reload again."
-                    : "Connect Announce could not load its files.");
+                    : "Connect Announce could not load its files. Announcements stay off until css_ca_reload succeeds.");
+                return false;
             }
         }
     }
@@ -935,12 +1017,15 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
             Logger.LogWarning("LanCountryCode '{Code}' is not a known two-letter country code, so {{PLAYERCOUNTRYSHORT3}} will show '???' for players on a local address.", lanCountryCode);
         }
 
-        // A malformed flag is not worth refusing to load over, but silently matching
-        // nobody is the exact symptom that is impossible to diagnose from in-game.
+        // A malformed flag is not worth refusing to load over. It must not reach
+        // CounterStrikeSharp either: PlayerHasPermissions with a flag that does not start
+        // with '@' checks no domain at all and returns true for anyone listed in
+        // admins.json, so every such player would count as admin. Use the default instead
+        // and say so.
         var adminFlag = config.AdminFlag?.Trim();
         if (!string.IsNullOrWhiteSpace(adminFlag) && !adminFlag.StartsWith('@'))
         {
-            Logger.LogWarning("AdminFlag '{Flag}' does not start with '@', so it will not match any admin. Did you mean '{Suggestion}'?", adminFlag, "@" + adminFlag.TrimStart('#'));
+            Logger.LogWarning("AdminFlag '{Flag}' does not start with '@', so it is ignored and the default '{Default}' is used instead. Did you mean '{Suggestion}'?", adminFlag, DefaultAdminFlag, "@" + adminFlag.TrimStart('#'));
         }
 
         // Same reasoning: an unrecognised mode falls back to the long-standing behaviour
@@ -972,8 +1057,21 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
             return;
         }
 
-        _countryShow = KeyValuesParser.Parse(File.ReadAllText(_settingsPath));
-        EnsureDefaultCountryMessages();
+        // Parse and complete into a candidate first. A file the parser rejects throws
+        // InvalidDataException with the line, which LoadAllFiles reports like any other
+        // invalid config: no announcements on startup, previous templates kept on reload.
+        KeyValuesNode candidate;
+        try
+        {
+            candidate = KeyValuesParser.Parse(File.ReadAllText(_settingsPath));
+        }
+        catch (InvalidDataException ex)
+        {
+            throw new InvalidDataException($"{_settingsPath} is not valid: {ex.Message}", ex);
+        }
+
+        EnsureDefaultCountryMessages(candidate);
+        _countryShow = candidate;
     }
 
     private string GetCountryMessage(string sectionName, string key)
@@ -989,12 +1087,12 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
         return defaults.Children[sectionName].Children[key].Value ?? "";
     }
 
-    private void EnsureDefaultCountryMessages()
+    private static void EnsureDefaultCountryMessages(KeyValuesNode target)
     {
         var defaults = DefaultCountryShow();
         foreach (var (sectionName, section) in defaults.Children)
         {
-            var targetSection = _countryShow.GetOrAddChild(sectionName);
+            var targetSection = target.GetOrAddChild(sectionName);
             foreach (var (key, value) in section.Children)
             {
                 if (!targetSection.Children.ContainsKey(key))
@@ -1044,8 +1142,8 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
     private const string SubjectAdminMessageMode = "Subject";
     private const string RecipientAdminMessageMode = "Recipient";
 
-    // Only an explicit, recognised "Recipient" switches modes. Anything else — a typo, an
-    // empty string, a key missing from an older config — keeps the original behaviour.
+    // Only an explicit, recognised "Recipient" switches modes. Anything else (a typo, an
+    // empty string, a key missing from an older config) keeps the original behaviour.
     private bool UseRecipientAdminMessages =>
         RecipientAdminMessageMode.Equals(_config.AdminMessageMode?.Trim(), StringComparison.OrdinalIgnoreCase);
 
@@ -1055,13 +1153,15 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
         return string.IsNullOrWhiteSpace(preferred) ? fallback : preferred.Trim();
     }
 
-    private string ResolvedAdminFlag
+    private const string DefaultAdminFlag = "@css/generic";
+
+    private string ResolvedAdminFlag => NormalizeAdminFlag(_config.AdminFlag);
+
+    // Empty, or a flag that does not start with '@' (see ValidateConfig), becomes the default.
+    internal static string NormalizeAdminFlag(string? configured)
     {
-        get
-        {
-            var flag = _config.AdminFlag?.Trim();
-            return string.IsNullOrEmpty(flag) ? "@css/generic" : flag;
-        }
+        var flag = configured?.Trim();
+        return !string.IsNullOrEmpty(flag) && flag.StartsWith('@') ? flag : DefaultAdminFlag;
     }
 
     private bool IsAdmin(SteamID? steamId)
@@ -1083,14 +1183,16 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
             return false;
         }
 
+        // Normalized again here so no caller can ever hand CounterStrikeSharp a flag without
+        // the leading '@', which it would treat as "no requirements" and answer true.
         return AdminManager.PlayerHasPermissions(steamId, "@css/root") ||
-               AdminManager.PlayerHasPermissions(steamId, adminFlag);
+               AdminManager.PlayerHasPermissions(steamId, NormalizeAdminFlag(adminFlag));
     }
 
     // Admin status of a message RECIPIENT. Recipients come from GetRealPlayers, which only
     // returns fully connected players, so reading their SteamID here is the easy case.
     // Fails closed: if it cannot be determined, treat them as a regular player so the admin
-    // variant — which may carry a SteamID or IP — is never shown to someone unverified.
+    // variant, which may carry a SteamID or IP, is never shown to someone unverified.
     private static bool IsAdminRecipient(CCSPlayerController player, string adminFlag)
     {
         try
@@ -1122,18 +1224,21 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
             return byUserId != null ? [byUserId] : [];
         }
 
-        if (ulong.TryParse(pattern, out var steam64))
+        // A SteamID in any of the three common spellings. Finding nobody is not the end: a
+        // purely numeric pattern can also be part of a player's name, so it falls through
+        // to the name search below.
+        if (TargetPatterns.TryParseSteamId64(pattern, out var steam64))
         {
-            var bySteam = players.FirstOrDefault(player => player.AuthorizedSteamID?.SteamId64 == steam64);
-            return bySteam != null ? [bySteam] : [];
+            var bySteam = players.FirstOrDefault(player => ReadAuthorizedSteam64(player) == steam64);
+            if (bySteam != null)
+            {
+                return [bySteam];
+            }
         }
 
-        var matches = players.Where(player =>
-                player.PlayerName.Contains(pattern, StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(GetSteamKey(player), pattern, StringComparison.OrdinalIgnoreCase))
+        return players
+            .Where(player => player.PlayerName.Contains(pattern, StringComparison.OrdinalIgnoreCase))
             .ToList();
-
-        return matches;
     }
 
     // Static so a deferred callback does not capture the plugin instance and keep an
@@ -1153,12 +1258,6 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
     private static bool IsConnectingPlayer(CCSPlayerController? player)
     {
         return player is { IsValid: true, IsBot: false, IsHLTV: false };
-    }
-
-    private static string? GetSteamKey(CCSPlayerController player)
-    {
-        var steam64 = player.AuthorizedSteamID?.SteamId64;
-        return steam64 == null ? null : ToSteam2(steam64.Value, universe: 1);
     }
 
     private static string ToSteam2(ulong steam64, int universe)
@@ -1238,7 +1337,9 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
             : names.Values.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value)) ?? fallback;
     }
 
-    // Generated once by walking AA..ZZ with RegionInfo on Windows (251 entries).
+    // Generated by walking AA..ZZ with RegionInfo on Windows, plus EH (Western Sahara),
+    // which RegionInfo does not know, added by hand. 250 entries, one per country code the
+    // GeoLite2-City database returns.
     private static readonly Dictionary<string, string> Iso3ByIso2 = new(StringComparer.OrdinalIgnoreCase)
     {
         ["AD"] = "AND",
@@ -1306,6 +1407,7 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
         ["EC"] = "ECU",
         ["EE"] = "EST",
         ["EG"] = "EGY",
+        ["EH"] = "ESH",
         ["ER"] = "ERI",
         ["ES"] = "ESP",
         ["ET"] = "ETH",
@@ -1525,18 +1627,34 @@ public sealed class ConnectAnnouncePlugin : BasePlugin
         "AE", "BS", "CD", "CF", "DO", "GB", "GM", "IM", "KM",
         "MV", "NL", "PH", "SC", "SD", "US",
         // Island groups, which take the article in the plural
-        "BQ", "CC", "CK", "FK", "FO", "KY", "MH", "SB", "TC", "UM", "VG", "VI"
+        "AX", "BQ", "CC", "CK", "FK", "FM", "FO", "HM", "KY", "MH", "MP", "PN", "SB", "TC", "UM", "VG", "VI"
     };
 
-    private static string AddThePrefix(string country, string countryCode2)
+    // The placeholder is used mid-sentence, so a database name that brings its own article
+    // ("The Netherlands") reads "the Netherlands". Only database names: LanCountry is the
+    // operator's text and is left as written.
+    private static string? LowercaseLeadingThe(string? name)
+    {
+        return name != null && name.StartsWith("The ", StringComparison.Ordinal)
+            ? "the " + name[4..]
+            : name;
+    }
+
+    internal static string AddThePrefix(string country, string countryCode2)
     {
         // Never stack articles. The stand-in wordings already carry one ("a Local Area
         // Network", "an Unknown Country"), and the article is chosen from the country code,
         // so a config that sets LanCountryCode without LanCountry would otherwise render
-        // "the a Local Area Network". No real country name begins with a bare article.
+        // "the a Local Area Network". No real country name begins with a bare "a" or "an".
         if (country.StartsWith("a ", StringComparison.OrdinalIgnoreCase) ||
-            country.StartsWith("an ", StringComparison.OrdinalIgnoreCase) ||
-            country.StartsWith("the ", StringComparison.OrdinalIgnoreCase))
+            country.StartsWith("an ", StringComparison.OrdinalIgnoreCase))
+        {
+            return country;
+        }
+
+        // A name that already carries "the" (the database's own, lowercased at lookup, or a
+        // LanCountry written that way on purpose) is used exactly as given.
+        if (country.StartsWith("the ", StringComparison.OrdinalIgnoreCase))
         {
             return country;
         }
@@ -1706,118 +1824,290 @@ internal sealed class KeyValuesNode(string name)
     }
 }
 
+// Reads the Valve KeyValues dialect the templates file uses. It is strict about structure:
+// the file is hand-edited and the result goes straight to every player's chat, so a mistake
+// has to fail the load (with the line number) rather than quietly produce a broken message.
+// Every failure is an InvalidDataException.
 internal static class KeyValuesParser
 {
-    public static KeyValuesNode Parse(string text)
-    {
-        var tokens = Tokenize(text).ToList();
-        if (tokens.Count == 0)
-        {
-            return new KeyValuesNode("Root");
-        }
-
-        var index = 0;
-        var rootName = tokens[index++];
-        var root = new KeyValuesNode(rootName);
-        if (index < tokens.Count && tokens[index] == "{")
-        {
-            index++;
-            ParseChildren(root, tokens, ref index);
-        }
-
-        return root;
-    }
-
     // A malformed file must not be able to take the server down. Without a depth limit,
     // deeply nested braces recurse until the stack overflows, and a StackOverflowException
     // cannot be caught: the whole game server process dies with nothing in the log.
     private const int MaxDepth = 32;
 
-    private static void ParseChildren(KeyValuesNode parent, IReadOnlyList<string> tokens, ref int index, int depth = 0)
+    private readonly record struct Token(string Text, bool Quoted, int Line)
+    {
+        public bool IsOpenBrace => !Quoted && Text == "{";
+        public bool IsCloseBrace => !Quoted && Text == "}";
+    }
+
+    public static KeyValuesNode Parse(string text)
+    {
+        var tokens = Tokenize(text);
+        if (tokens.Count == 0)
+        {
+            // An empty file is not an error: the defaults fill everything in.
+            return new KeyValuesNode("Root");
+        }
+
+        var index = 0;
+        var rootToken = tokens[index++];
+        if (rootToken.IsOpenBrace || rootToken.IsCloseBrace)
+        {
+            throw new InvalidDataException($"line {rootToken.Line}: expected the root section name (for example \"CountryShow\") but found '{rootToken.Text}'.");
+        }
+
+        if (index >= tokens.Count || !tokens[index].IsOpenBrace)
+        {
+            throw new InvalidDataException($"line {rootToken.Line}: the root section '{rootToken.Text}' is not followed by '{{'.");
+        }
+
+        var open = tokens[index++];
+        var root = new KeyValuesNode(rootToken.Text);
+        ParseChildren(root, rootToken.Text, open.Line, tokens, ref index, 0);
+
+        if (index < tokens.Count)
+        {
+            throw new InvalidDataException($"line {tokens[index].Line}: unexpected content after the closing brace of '{rootToken.Text}' (an extra '}}' or a second root section).");
+        }
+
+        return root;
+    }
+
+    private static void ParseChildren(KeyValuesNode parent, string sectionName, int openLine, IReadOnlyList<Token> tokens, ref int index, int depth)
     {
         if (depth > MaxDepth)
         {
-            throw new InvalidDataException($"KeyValues nesting is deeper than {MaxDepth} levels.");
+            throw new InvalidDataException($"line {openLine}: nesting is deeper than {MaxDepth} levels.");
         }
 
         while (index < tokens.Count)
         {
             var key = tokens[index++];
-            if (key == "}")
+            if (key.IsCloseBrace)
             {
                 return;
+            }
+
+            if (key.IsOpenBrace)
+            {
+                throw new InvalidDataException($"line {key.Line}: '{{' without a section name before it, inside '{sectionName}'.");
             }
 
             if (index >= tokens.Count)
             {
-                parent.GetOrAddChild(key);
-                return;
+                throw new InvalidDataException($"line {key.Line}: '{key.Text}' has no value, and the section '{sectionName}' opened on line {openLine} is never closed.");
             }
 
-            if (tokens[index] == "{")
+            var next = tokens[index];
+            if (next.IsOpenBrace)
             {
                 index++;
-                ParseChildren(parent.GetOrAddChild(key), tokens, ref index, depth + 1);
+                ParseChildren(parent.GetOrAddChild(key.Text), key.Text, next.Line, tokens, ref index, depth + 1);
+            }
+            else if (next.IsCloseBrace)
+            {
+                throw new InvalidDataException($"line {key.Line}: '{key.Text}' has no value before the '}}' on line {next.Line}.");
             }
             else
             {
-                parent.SetValue(key, tokens[index++]);
+                index++;
+                parent.SetValue(key.Text, next.Text);
             }
         }
+
+        throw new InvalidDataException($"the section '{sectionName}' opened on line {openLine} is never closed (missing '}}').");
     }
 
-    private static IEnumerable<string> Tokenize(string text)
+    private static List<Token> Tokenize(string text)
     {
+        var tokens = new List<Token>();
+        var line = 1;
         for (var i = 0; i < text.Length;)
         {
-            if (char.IsWhiteSpace(text[i]))
+            var ch = text[i];
+            if (ch == '\n')
+            {
+                line++;
+                i++;
+                continue;
+            }
+
+            if (char.IsWhiteSpace(ch))
             {
                 i++;
                 continue;
             }
 
-            if (text[i] == '/' && i + 1 < text.Length && text[i + 1] == '/')
+            if (ch == '/' && i + 1 < text.Length && text[i + 1] == '/')
             {
                 while (i < text.Length && text[i] != '\n') i++;
                 continue;
             }
 
-            if (text[i] is '{' or '}')
+            if (ch is '{' or '}')
             {
-                yield return text[i++].ToString();
+                tokens.Add(new Token(ch.ToString(), false, line));
+                i++;
                 continue;
             }
 
-            if (text[i] == '"')
+            if (ch == '"')
             {
+                var startLine = line;
                 var builder = new StringBuilder();
+                var closed = false;
                 i++;
                 while (i < text.Length)
                 {
-                    if (text[i] == '\\' && i + 1 < text.Length)
+                    var c = text[i];
+                    if (c == '\\' && i + 1 < text.Length && text[i + 1] is not ('\n' or '\r'))
                     {
-                        builder.Append(text[i + 1]);
+                        // Only \" and \\ are escapes. Any other \x keeps its backslash, so a
+                        // literal "\n" stays two characters instead of silently becoming "n".
+                        var escaped = text[i + 1];
+                        if (escaped is '"' or '\\')
+                        {
+                            builder.Append(escaped);
+                        }
+                        else
+                        {
+                            builder.Append(c).Append(escaped);
+                        }
+
                         i += 2;
                         continue;
                     }
 
-                    if (text[i] == '"')
+                    if (c == '"')
                     {
                         i++;
+                        closed = true;
                         break;
                     }
 
-                    builder.Append(text[i++]);
+                    // A line break inside quotes is never intended in a chat template, and is
+                    // what an unclosed quote looks like: it would swallow the lines after it.
+                    if (c is '\n' or '\r')
+                    {
+                        throw new InvalidDataException($"line {startLine}: the quoted string is not closed on its line (missing closing '\"'?). Line breaks are not allowed inside a value.");
+                    }
+
+                    builder.Append(c);
+                    i++;
                 }
 
-                yield return builder.ToString();
+                if (!closed)
+                {
+                    throw new InvalidDataException($"line {startLine}: the quoted string is never closed (missing closing '\"').");
+                }
+
+                tokens.Add(new Token(builder.ToString(), true, startLine));
                 continue;
             }
 
             var start = i;
             while (i < text.Length && !char.IsWhiteSpace(text[i]) && text[i] is not '{' and not '}') i++;
-            yield return text[start..i];
+            tokens.Add(new Token(text[start..i], false, line));
         }
+
+        return tokens;
+    }
+}
+
+// Pure helpers for css_geolist targets and player names, kept out of the plugin class so they
+// can be exercised without a running server.
+internal static class TargetPatterns
+{
+    private static readonly Regex Steam2Pattern = new(@"^STEAM_[01]:([01]):(\d{1,10})$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex Steam3Pattern = new(@"^\[?U:1:(\d{1,10})\]?$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    // The pattern the command was given: the whole argument string so a name with spaces
+    // works unquoted, minus one pair of outer quotes if the player typed them. Falls back
+    // to the first argument when the string is empty.
+    public static string NormalizePattern(string? argString, Func<string> firstArg)
+    {
+        var text = argString?.Trim() ?? "";
+        if (text.Length >= 2 && text[0] == '"' && text[^1] == '"')
+        {
+            text = text[1..^1].Trim();
+        }
+
+        // Selectors (@me, @all, #userid) are a single token; anything after them is ignored,
+        // as it was before the whole argument string was used.
+        if (text.Length > 0 && (text[0] == '@' || text[0] == '#'))
+        {
+            return firstArg().Trim();
+        }
+
+        return text.Length > 0 ? text : firstArg().Trim();
+    }
+
+    // SteamID64, STEAM_0:y:z or STEAM_1:y:z, and [U:1:n] (brackets optional).
+    public static bool TryParseSteamId64(string pattern, out ulong steam64)
+    {
+        steam64 = 0;
+        var text = pattern.Trim();
+
+        if (text.Length > 0 && text.All(char.IsAsciiDigit))
+        {
+            return ulong.TryParse(text, NumberStyles.None, CultureInfo.InvariantCulture, out steam64);
+        }
+
+        var steam2 = Steam2Pattern.Match(text);
+        if (steam2.Success &&
+            uint.TryParse(steam2.Groups[2].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var authId))
+        {
+            steam64 = ConnectAnnouncePlugin.SteamId64Base + (ulong)authId * 2 + ulong.Parse(steam2.Groups[1].Value, CultureInfo.InvariantCulture);
+            return true;
+        }
+
+        var steam3 = Steam3Pattern.Match(text);
+        if (steam3.Success &&
+            uint.TryParse(steam3.Groups[1].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var accountId))
+        {
+            steam64 = ConnectAnnouncePlugin.SteamId64Base + accountId;
+            return true;
+        }
+
+        return false;
+    }
+
+    // A name goes into chat and the console reply, so strip control characters (below 0x20
+    // and DEL). In chat they are the colour codes and line breaks, which would let a name
+    // recolour or split the announcement.
+    public static string SanitizeName(string? name)
+    {
+        if (string.IsNullOrEmpty(name))
+        {
+            return "";
+        }
+
+        var needsClean = false;
+        foreach (var ch in name)
+        {
+            if (ch < 0x20 || ch == 0x7F)
+            {
+                needsClean = true;
+                break;
+            }
+        }
+
+        if (!needsClean)
+        {
+            return name;
+        }
+
+        var builder = new StringBuilder(name.Length);
+        foreach (var ch in name)
+        {
+            if (ch >= 0x20 && ch != 0x7F)
+            {
+                builder.Append(ch);
+            }
+        }
+
+        return builder.ToString();
     }
 }
 
